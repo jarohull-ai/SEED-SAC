@@ -1,8 +1,8 @@
-# SEED SAC — System-Aware Copilot
-
 <p align="center">
-  <img src="assets/seed-sac-logo.jpeg" alt="SEED SAC — application state protected in a fraction of a second" width="560">
+  <img src="assets/logo.png" alt="SEED SAC Logo" width="320"/>
 </p>
+
+# SEED SAC — System-Aware Copilot
 
 <p align="center"><strong>Application state protected in a fraction of a second.</strong></p>
 
