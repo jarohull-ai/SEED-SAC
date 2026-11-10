@@ -474,13 +474,27 @@ fn handle_command(
     match &intent {
         l0::Intent::Unknown { .. } => {
             pending_confirmation.take();
-            return Some(
-                "Nie zrozumiałem polecenia.\nSpróbuj: 'kill <process>', 'why is CPU high?'"
-                    .to_owned(),
-            );
+            // Fallback: check if router recognizes it as a command
+            let action = router::parse(text);
+            match action {
+                router::Action::QueryL1(_) => {
+                    // Router can't parse - L0 also said Unknown
+                    return Some(
+                        "Nie zrozumiałem polecenia.\nSpróbuj: 'kill <process>', 'why is CPU high?'"
+                            .to_owned(),
+                    );
+                }
+                _ => {
+                    // Router recognized a command - proceed to execution
+                }
+            }
         }
         l0::Intent::Analysis { .. } => {
             pending_confirmation.take();
+            // Submit to L1 worker
+            if !l1_worker.submit(text.to_owned(), generation) {
+                return Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned());
+            }
             return Some("L1: oczekiwanie na lokalny model…".to_owned());
         }
         l0::Intent::Command { .. } => {
@@ -488,7 +502,7 @@ fn handle_command(
         }
     }
 
-    // For Command intent, parse and execute via grammar
+    // For Command intent (or fallback recognized command), parse and execute via grammar
     let action = router::parse(text);
     if is_destructive(&action) {
         let description = confirmation_description(&action);
