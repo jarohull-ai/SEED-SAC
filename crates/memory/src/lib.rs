@@ -249,6 +249,9 @@ fn ensure_database_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_event_type_as_str() {
@@ -373,21 +376,31 @@ mod tests {
 
     #[test]
     fn test_default_database_path_with_xdg() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let previous = std::env::var_os("XDG_DATA_HOME");
         unsafe { std::env::set_var("XDG_DATA_HOME", "/tmp/xdg-data") };
         let path = default_database_path();
         assert!(path.to_string_lossy().contains("xdg-data"));
         assert!(path.to_string_lossy().contains("seed-sac"));
-        unsafe { std::env::remove_var("XDG_DATA_HOME") };
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XDG_DATA_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_DATA_HOME") },
+        }
     }
 
     #[test]
     fn test_default_database_path_without_xdg() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let previous = std::env::var_os("XDG_DATA_HOME");
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
         let path = default_database_path();
         assert!(
             path.to_string_lossy().contains(".local/share/seed-sac")
                 || path.to_string_lossy().contains("seed-sac")
         );
+        if let Some(value) = previous {
+            unsafe { std::env::set_var("XDG_DATA_HOME", value) };
+        }
     }
 
     #[test]
