@@ -89,8 +89,13 @@ mod tests {
         assert!(snapshot.ram_total_bytes > 0);
         assert!(snapshot.ram_used_bytes <= snapshot.ram_total_bytes);
         assert!(!snapshot.processes.is_empty());
-        assert!(snapshot.vram_used_bytes.is_none());
-        assert!(snapshot.vram_total_bytes.is_none());
+        match (snapshot.vram_used_bytes, snapshot.vram_total_bytes) {
+            (Some(used), Some(total)) => assert!(used <= total),
+            (None, None) => {}
+            (Some(_), None) | (None, Some(_)) => {
+                panic!("VRAM used and total values must be reported together")
+            }
+        }
     }
 
     #[test]

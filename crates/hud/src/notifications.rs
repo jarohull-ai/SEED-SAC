@@ -7,7 +7,13 @@ use crate::{Alert, AlertAction, UserAction};
 const WARN_FILL: Color32 = Color32::from_rgb(0x4A, 0x3A, 0x10);
 const WARN_STROKE: Color32 = Color32::from_rgb(0xFF, 0xC1, 0x07);
 
-pub fn draw_alerts(ui: &mut egui::Ui, alerts: &[Alert], action_tx: &Sender<UserAction>) {
+pub fn draw_alerts(
+    ui: &mut egui::Ui,
+    alerts: &[Alert],
+    action_tx: &Sender<UserAction>,
+    terminate_enabled: bool,
+) -> bool {
+    let mut action_sent = false;
     for alert in alerts {
         egui::Frame::new()
             .fill(WARN_FILL)
@@ -28,13 +34,19 @@ pub fn draw_alerts(ui: &mut egui::Ui, alerts: &[Alert], action_tx: &Sender<UserA
                             AlertAction::Resume => ("Wznów", UserAction::Resume(alert.pid)),
                             AlertAction::Terminate => ("Zakończ", UserAction::Terminate(alert.pid)),
                         };
-                        if ui.button(label).clicked() {
+                        let button = ui.add_enabled(
+                            !matches!(action, AlertAction::Terminate) || terminate_enabled,
+                            egui::Button::new(label),
+                        );
+                        if button.clicked() {
                             // Receiver gone means the sentinel shut down; nothing to do.
                             let _ = action_tx.send(user_action);
+                            action_sent = true;
                         }
                     }
                 });
             });
         ui.add_space(4.0);
     }
+    action_sent
 }

@@ -37,17 +37,44 @@ use sentinel::{SystemSnapshot, SystemState, policy};
 /// Smallest poll interval we accept, to keep a malformed config from turning
 /// the sentinel into a busy loop.
 const MIN_POLL_INTERVAL_MS: u64 = 50;
+/// Largest poll interval accepted, so malformed configuration cannot disable
+/// sentinel monitoring by making the wait effectively unbounded.
+const MAX_POLL_INTERVAL_MS: u64 = 5_000;
+/// Maximum time the sentinel waits before checking for a newly submitted HUD
+/// command. This is independent of telemetry sampling, so a large sampling
+/// interval cannot hide the pending acknowledgement.
+const COMMAND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a router reply stays visible in the HUD.
 const COMMAND_RESPONSE_TTL: Duration = Duration::from_secs(5);
 const L1_OFFLINE_MESSAGE: &str = "L1 offline (LM Studio niedostępne na porcie 1234)";
+const CONFIRM_COMMAND: &str = "__sac_confirm";
+const CANCEL_COMMAND: &str = "__sac_cancel";
+const CONFIRMATION_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingAction {
+    Router {
+        action: router::Action,
+        identity: Option<ProcessIdentity>,
+    },
+    AlertTerminate {
+        identity: ProcessIdentity,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PendingConfirmation {
+    action: PendingAction,
+    expires_at: Instant,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
     let config = sentinel::config::load();
     let poll_interval =
-        Duration::from_millis(config.sentinel.poll_interval_ms.max(MIN_POLL_INTERVAL_MS));
+        Duration::from_millis(normalize_poll_interval_ms(config.sentinel.poll_interval_ms));
 
     tracing::info!(
         poll_interval_ms = poll_interval.as_millis(),
@@ -117,6 +144,16 @@ fn init_tracing() {
         .init();
 }
 
+fn normalize_poll_interval_ms(poll_interval_ms: u64) -> u64 {
+    poll_interval_ms.clamp(MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS)
+}
+
+fn sentinel_wait_duration(next_sample_at: Instant, now: Instant) -> Duration {
+    next_sample_at
+        .saturating_duration_since(now)
+        .min(COMMAND_CHECK_INTERVAL)
+}
+
 /// Main loop of the background sentinel thread.
 ///
 /// It publishes a fresh display snapshot on every tick, keeps frozen-process
@@ -137,51 +174,60 @@ fn run_sentinel(
     let mut banner: Option<CommandBanner> = None;
     let mut l1_worker = L1Worker::spawn(&config);
     let mut command_generation = 0_u64;
+    let mut pending_confirmation: Option<PendingConfirmation> = None;
+    let mut next_sample_at = Instant::now();
+    let mut latest_snapshot: Option<SystemSnapshot> = None;
+    let mut latest_state = SystemState::Green;
     while running.load(Ordering::Acquire) {
-        let snapshot = sampler.poll();
-        let deltas = tracker.update(&snapshot);
-        let state = policy::evaluate(&snapshot, &config);
-        let actions = guard::mitigate(state, &deltas, &config);
+        if Instant::now() >= next_sample_at {
+            let snapshot = sampler.poll();
+            let deltas = tracker.update(&snapshot);
+            let state = policy::evaluate(&snapshot, &config);
+            let actions = guard::mitigate(state, &deltas, &config);
 
-        for action in &actions {
-            let Some(process) = snapshot
-                .processes
-                .iter()
-                .find(|p| p.pid == action_pid(*action))
-            else {
-                tracing::warn!(?action, "mitigation target disappeared before execution");
-                continue;
-            };
-            match guard::execute_for(action, &process.identity()) {
-                Ok(()) => {
-                    if let GuardAction::Freeze { pid } = *action {
-                        let name = process_name(&snapshot, pid);
-                        tracing::warn!(pid, process = %name, "froze process to prevent OOM");
-                        alerts.insert(
-                            pid,
-                            Alert {
+            for action in &actions {
+                let Some(process) = snapshot
+                    .processes
+                    .iter()
+                    .find(|p| p.pid == action_pid(*action))
+                else {
+                    tracing::warn!(?action, "mitigation target disappeared before execution");
+                    continue;
+                };
+                match guard::execute_for(action, &process.identity(), &config) {
+                    Ok(()) => {
+                        if let GuardAction::Freeze { pid } = *action {
+                            let name = process_name(&snapshot, pid);
+                            tracing::warn!(pid, process = %name, "froze process to prevent OOM");
+                            alerts.insert(
                                 pid,
-                                process_name: name,
-                                message: "Gwałtowny wzrost pamięci — proces zamrożony \
-                                          (SIGSTOP). Wznów go lub zakończ."
-                                    .to_owned(),
-                                actions: vec![AlertAction::Resume, AlertAction::Terminate],
-                            },
-                        );
-                        alert_targets.insert(pid, process.identity());
+                                Alert {
+                                    pid,
+                                    process_name: name,
+                                    message: "Gwałtowny wzrost pamięci — proces zamrożony \
+                                              (SIGSTOP). Wznów go lub zakończ."
+                                        .to_owned(),
+                                    actions: vec![AlertAction::Resume, AlertAction::Terminate],
+                                },
+                            );
+                            alert_targets.insert(pid, process.identity());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(?action, %err, "guard action failed");
                     }
                 }
-                Err(err) => {
-                    tracing::error!(?action, %err, "guard action failed");
-                }
             }
-        }
 
-        // A frozen process can exit on its own (or be killed elsewhere); drop
-        // alerts whose PID is no longer present so the HUD does not offer
-        // actions for ghosts.
-        alerts.retain(|pid, _| snapshot.processes.iter().any(|process| process.pid == *pid));
-        alert_targets.retain(|pid, _| alerts.contains_key(pid));
+            // A frozen process can exit on its own (or be killed elsewhere); drop
+            // alerts whose PID is no longer present so the HUD does not offer
+            // actions for ghosts.
+            alerts.retain(|pid, _| snapshot.processes.iter().any(|process| process.pid == *pid));
+            alert_targets.retain(|pid, _| alerts.contains_key(pid));
+            latest_snapshot = Some(snapshot);
+            latest_state = state;
+            next_sample_at = Instant::now() + poll_interval;
+        }
 
         while let Some((generation, response)) = l1_worker.try_response() {
             if generation == command_generation {
@@ -194,17 +240,35 @@ fn run_sentinel(
         while let Ok(UserCommand(text)) = command_rx.try_recv() {
             command_generation = command_generation.wrapping_add(1);
             banner = None;
-            if let Some(response) =
-                handle_command(&text, &mut l1_worker, &config, command_generation)
-            {
+            if let Some(response) = handle_command(
+                &text,
+                &mut l1_worker,
+                &config,
+                command_generation,
+                latest_snapshot.as_ref(),
+                &mut pending_confirmation,
+            ) {
                 banner = Some(CommandBanner::new(response, Instant::now()));
             }
             tracing::info!("HUD command handled");
         }
 
+        if pending_confirmation
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.expires_at)
+        {
+            pending_confirmation = None;
+            banner = Some(CommandBanner::new(
+                "Potwierdzenie wygasło — akcja nie została wykonana".to_owned(),
+                Instant::now(),
+            ));
+        }
+
         shared_state.store(Arc::new(display_state(
-            &snapshot,
-            state,
+            latest_snapshot
+                .as_ref()
+                .expect("sentinel samples before publishing display state"),
+            latest_state,
             &alerts,
             banner.as_ref().map(|banner| banner.text.as_str()),
             &config,
@@ -219,8 +283,20 @@ fn run_sentinel(
             banner = None;
         }
 
-        match action_rx.recv_timeout(poll_interval) {
-            Ok(action) => apply_user_action(action, &mut alerts, &mut alert_targets),
+        let wait_for = sentinel_wait_duration(next_sample_at, Instant::now());
+        match action_rx.recv_timeout(wait_for) {
+            Ok(action) => {
+                if let Some(response) = handle_user_action(
+                    action,
+                    latest_snapshot.as_ref(),
+                    &config,
+                    &mut alerts,
+                    &mut alert_targets,
+                    &mut pending_confirmation,
+                ) {
+                    banner = Some(CommandBanner::new(response, Instant::now()));
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
@@ -236,8 +312,164 @@ fn handle_command(
     l1_worker: &mut L1Worker,
     config: &Config,
     generation: u64,
+    snapshot: Option<&SystemSnapshot>,
+    pending_confirmation: &mut Option<PendingConfirmation>,
 ) -> Option<String> {
     let action = router::parse(text);
+    if text.trim() == CONFIRM_COMMAND {
+        let Some(pending) = pending_confirmation.take() else {
+            return Some("Brak oczekującej akcji do potwierdzenia".to_owned());
+        };
+        if Instant::now() >= pending.expires_at {
+            return Some("Potwierdzenie wygasło — akcja nie została wykonana".to_owned());
+        }
+        return execute_pending_action(pending.action, snapshot, l1_worker, config, generation);
+    }
+    if text.trim() == CANCEL_COMMAND {
+        if pending_confirmation.take().is_some() {
+            return Some("Anulowano oczekującą akcję".to_owned());
+        }
+        return Some("Brak oczekującej akcji do anulowania".to_owned());
+    }
+    if is_destructive(&action) {
+        let description = confirmation_description(&action);
+        let identity = match &action {
+            router::Action::Kill(name) => {
+                if sentinel::policy::is_immune(name, config) {
+                    return Some(format!(
+                        "{name} jest na liście procesów chronionych — akcja zablokowana"
+                    ));
+                }
+                let Some(snapshot) = snapshot else {
+                    return Some("Brak aktualnego obrazu procesów — akcja zablokowana".to_owned());
+                };
+                let mut matches = snapshot
+                    .processes
+                    .iter()
+                    .filter(|process| process.name.eq_ignore_ascii_case(name.trim()));
+                let Some(process) = matches.next() else {
+                    return Some(format!("Nie znaleziono procesu o nazwie {name}"));
+                };
+                if matches.next().is_some() {
+                    return Some(format!(
+                        "Nie można jednoznacznie wybrać procesu o nazwie {name}"
+                    ));
+                }
+                Some(process.identity())
+            }
+            _ => None,
+        };
+        *pending_confirmation = Some(PendingConfirmation {
+            action: PendingAction::Router { action, identity },
+            expires_at: Instant::now() + CONFIRMATION_TTL,
+        });
+        let description = match pending_confirmation.as_ref().map(|pending| &pending.action) {
+            Some(PendingAction::Router {
+                action: router::Action::Kill(_),
+                identity: Some(identity),
+            }) => format!(
+                "Zakończenie procesu '{}' (PID {})",
+                identity.name, identity.pid
+            ),
+            _ => description,
+        };
+        return Some(format!(
+            "POTWIERDZENIE: {description}\nNaciśnij Enter lub wybierz Potwierdź, aby wykonać."
+        ));
+    }
+    // A normal command replaces an outstanding confirmation, so an old
+    // destructive action can never execute after the user changes context.
+    pending_confirmation.take();
+    execute_command_action(action, l1_worker, config, generation)
+}
+
+fn is_destructive(action: &router::Action) -> bool {
+    matches!(action, router::Action::Kill(_) | router::Action::CleanCache)
+}
+
+fn confirmation_description(action: &router::Action) -> String {
+    match action {
+        router::Action::Kill(name) => format!("Zakończenie procesu '{name}'"),
+        router::Action::CleanCache => "Wyczyszczenie pamięci podręcznej (drop_caches=3)".to_owned(),
+        _ => unreachable!("only destructive actions require confirmation"),
+    }
+}
+
+fn execute_pending_action(
+    action: PendingAction,
+    snapshot: Option<&SystemSnapshot>,
+    l1_worker: &mut L1Worker,
+    config: &Config,
+    generation: u64,
+) -> Option<String> {
+    match action {
+        PendingAction::Router { action, identity } => {
+            if let router::Action::Kill(_) = action {
+                let Some(identity) = identity else {
+                    return Some(
+                        "Brak zweryfikowanej tożsamości procesu — akcja zablokowana".to_owned(),
+                    );
+                };
+                if sentinel::policy::is_immune(&identity.name, config) {
+                    return Some(format!(
+                        "{} jest na liście procesów chronionych — akcja zablokowana",
+                        identity.name
+                    ));
+                }
+                return match guard::execute_for(
+                    &GuardAction::Kill { pid: identity.pid },
+                    &identity,
+                    config,
+                ) {
+                    Ok(()) => Some(format!("Zamknięto {}", identity.name)),
+                    Err(error) => Some(format!("Błąd: {error}")),
+                };
+            }
+            execute_confirmed_command_action(action, l1_worker, config, generation)
+        }
+        PendingAction::AlertTerminate { identity } => {
+            let Some(snapshot) = snapshot else {
+                return Some("Brak aktualnego obrazu procesów — akcja zablokowana".to_owned());
+            };
+            let Some(current) = snapshot
+                .processes
+                .iter()
+                .find(|process| process.pid == identity.pid)
+            else {
+                return Some("Proces zniknął — akcja anulowana".to_owned());
+            };
+            if current.identity() != identity {
+                return Some("Tożsamość procesu zmieniła się — akcja zablokowana".to_owned());
+            }
+            if sentinel::policy::is_immune(&identity.name, config) {
+                return Some(format!(
+                    "{} jest na liście procesów chronionych — akcja zablokowana",
+                    identity.name
+                ));
+            }
+            match apply_terminate_identity(&identity, config) {
+                Ok(()) => Some(format!("Zamknięto {}", identity.name)),
+                Err(error) => Some(format!("Błąd: {error}")),
+            }
+        }
+    }
+}
+
+fn apply_terminate_identity(identity: &ProcessIdentity, config: &Config) -> Result<(), String> {
+    guard::execute_for(&GuardAction::Thaw { pid: identity.pid }, identity, config)?;
+    guard::execute_for(
+        &GuardAction::Terminate { pid: identity.pid },
+        identity,
+        config,
+    )
+}
+
+fn execute_command_action(
+    action: router::Action,
+    l1_worker: &mut L1Worker,
+    config: &Config,
+    generation: u64,
+) -> Option<String> {
     if matches!(action, router::Action::QueryL1(_)) {
         if let router::Action::QueryL1(query) = action
             && !l1_worker.submit(query, generation)
@@ -247,6 +479,25 @@ fn handle_command(
         return Some("L1: oczekiwanie na lokalny model…".to_owned());
     }
     match router::executor::execute_with_config(&action, config) {
+        ExecResult::Done(message) => Some(message),
+        ExecResult::NeedsL1(query) => {
+            if l1_worker.submit(query, generation) {
+                None
+            } else {
+                Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned())
+            }
+        }
+        ExecResult::Error(message) => Some(format!("Błąd: {message}")),
+    }
+}
+
+fn execute_confirmed_command_action(
+    action: router::Action,
+    l1_worker: &mut L1Worker,
+    config: &Config,
+    generation: u64,
+) -> Option<String> {
+    match router::executor::execute_confirmed_with_config(&action, config) {
         ExecResult::Done(message) => Some(message),
         ExecResult::NeedsL1(query) => {
             if l1_worker.submit(query, generation) {
@@ -333,9 +584,14 @@ struct CommandBanner {
 
 impl CommandBanner {
     fn new(text: String, created_at: Instant) -> Self {
+        let ttl = if text.starts_with("POTWIERDZENIE:") {
+            CONFIRMATION_TTL
+        } else {
+            COMMAND_RESPONSE_TTL
+        };
         Self {
             text,
-            expires_at: created_at + COMMAND_RESPONSE_TTL,
+            expires_at: created_at + ttl,
         }
     }
 
@@ -364,25 +620,43 @@ fn user_action_guard_actions(action: UserAction) -> Vec<GuardAction> {
 /// terminate alerts pending until the next snapshot confirms that the PID is
 /// gone. Resume is different: a successful thaw resolves the frozen-process
 /// alert immediately.
-fn apply_user_action(
+fn handle_user_action(
     action: UserAction,
+    snapshot: Option<&SystemSnapshot>,
+    config: &Config,
     alerts: &mut BTreeMap<u32, Alert>,
     alert_targets: &mut BTreeMap<u32, ProcessIdentity>,
-) {
+    pending_confirmation: &mut Option<PendingConfirmation>,
+) -> Option<String> {
     let pid = match action {
         UserAction::Resume(pid) | UserAction::Terminate(pid) => pid,
     };
 
     let Some(identity) = alert_targets.get(&pid).cloned() else {
         tracing::warn!(pid, "user action refused: no verified alert identity");
-        return;
+        return Some("Brak zweryfikowanej tożsamości alertu — akcja zablokowana".to_owned());
     };
+    if matches!(action, UserAction::Terminate(_)) {
+        if let Some(pending) = pending_confirmation.as_ref()
+            && Instant::now() < pending.expires_at
+        {
+            return Some("POTWIERDZENIE: Oczekuje już decyzja dla akcji destrukcyjnej".to_owned());
+        }
+        return Some(confirm_alert_termination(
+            identity,
+            snapshot,
+            &mut *alerts,
+            alert_targets,
+            pending_confirmation,
+        ));
+    };
+    let cancelled_confirmation = cancel_pending_for_resume(action, pending_confirmation);
     for guard_action in user_action_guard_actions(action) {
-        if let Err(err) = guard::execute_for(&guard_action, &identity) {
+        if let Err(err) = guard::execute_for(&guard_action, &identity, config) {
             // Keep the alert: the user may want to retry or choose the other
             // action (e.g. SIGCONT failed, so SIGTERM must not be attempted).
             tracing::warn!(pid, ?action, %err, "user action failed");
-            return;
+            return Some(format!("Błąd: {err}"));
         }
     }
 
@@ -391,6 +665,53 @@ fn apply_user_action(
         alert_targets.remove(&pid);
     }
     tracing::info!(pid, ?action, "user action applied");
+    cancelled_confirmation
+        .then_some("Anulowano oczekującą akcję przed wznowieniem procesu".to_owned())
+}
+
+fn cancel_pending_for_resume(
+    action: UserAction,
+    pending_confirmation: &mut Option<PendingConfirmation>,
+) -> bool {
+    matches!(action, UserAction::Resume(_)) && pending_confirmation.take().is_some()
+}
+
+fn confirm_alert_termination(
+    identity: ProcessIdentity,
+    snapshot: Option<&SystemSnapshot>,
+    alerts: &mut BTreeMap<u32, Alert>,
+    alert_targets: &mut BTreeMap<u32, ProcessIdentity>,
+    pending_confirmation: &mut Option<PendingConfirmation>,
+) -> String {
+    let Some(snapshot) = snapshot else {
+        return "Brak aktualnego obrazu procesów — akcja zablokowana".to_owned();
+    };
+    let Some(current) = snapshot
+        .processes
+        .iter()
+        .find(|process| process.pid == identity.pid)
+    else {
+        alerts.remove(&identity.pid);
+        alert_targets.remove(&identity.pid);
+        return "Proces zniknął — akcja anulowana".to_owned();
+    };
+    if current.identity() != identity {
+        alerts.remove(&identity.pid);
+        alert_targets.remove(&identity.pid);
+        return "Tożsamość procesu zmieniła się — akcja zablokowana".to_owned();
+    }
+    // The actual SIGTERM is deliberately deferred until the explicit HUD
+    // confirmation command is received.
+    *pending_confirmation = Some(PendingConfirmation {
+        action: PendingAction::AlertTerminate {
+            identity: identity.clone(),
+        },
+        expires_at: Instant::now() + CONFIRMATION_TTL,
+    });
+    format!(
+        "POTWIERDZENIE: Zakończenie procesu '{}' (PID {})\nNaciśnij Enter lub wybierz Potwierdź, aby wykonać.",
+        identity.name, identity.pid
+    )
 }
 
 fn display_state(
@@ -472,6 +793,180 @@ mod tests {
     }
 
     #[test]
+    fn poll_interval_is_clamped_to_safe_bounds() {
+        assert_eq!(normalize_poll_interval_ms(0), MIN_POLL_INTERVAL_MS);
+        assert_eq!(normalize_poll_interval_ms(250), 250);
+        assert_eq!(normalize_poll_interval_ms(u64::MAX), MAX_POLL_INTERVAL_MS);
+    }
+
+    #[test]
+    fn command_check_wait_is_bounded_independently_of_sample_interval() {
+        let now = Instant::now();
+        assert_eq!(
+            sentinel_wait_duration(now + Duration::from_secs(30), now),
+            COMMAND_CHECK_INTERVAL
+        );
+        assert_eq!(
+            sentinel_wait_duration(now + Duration::from_millis(10), now),
+            Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn l1_command_shows_pending_ack_before_worker_response() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+
+        let response = handle_command("ask local model", &mut worker, &config, 1, None, &mut None);
+
+        assert_eq!(
+            response.as_deref(),
+            Some("L1: oczekiwanie na lokalny model…")
+        );
+    }
+
+    #[test]
+    fn destructive_command_fails_closed_without_process_snapshot() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+        let mut pending = None;
+
+        let response = handle_command(
+            "kill seed-sac-missing-process-xyz",
+            &mut worker,
+            &config,
+            1,
+            None,
+            &mut pending,
+        );
+
+        assert_eq!(
+            response.as_deref(),
+            Some("Brak aktualnego obrazu procesów — akcja zablokowana")
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn kill_rejects_immune_process_case_insensitively() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        config.guard.immune_process_names = vec!["CaRgO".to_owned()];
+        let mut worker = L1Worker::spawn(&config);
+        let mut pending = None;
+
+        let response = handle_command(
+            "kill CARGO",
+            &mut worker,
+            &config,
+            1,
+            Some(&snapshot()),
+            &mut pending,
+        );
+
+        assert_eq!(
+            response.as_deref(),
+            Some("cargo jest na liście procesów chronionych — akcja zablokowana")
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn kill_lookup_is_case_insensitive_and_confirmation_has_name_and_pid() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+        let mut pending = None;
+
+        let response = handle_command(
+            "kill CARGO",
+            &mut worker,
+            &config,
+            1,
+            Some(&snapshot()),
+            &mut pending,
+        )
+        .unwrap();
+
+        assert!(response.contains("'cargo' (PID 42)"));
+        assert!(pending.is_some());
+    }
+
+    #[test]
+    fn explicit_confirmation_executes_pending_action() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+        let mut pending = Some(PendingConfirmation {
+            action: PendingAction::Router {
+                action: router::Action::Kill("seed-sac-missing-process-xyz".to_owned()),
+                identity: None,
+            },
+            expires_at: Instant::now() + CONFIRMATION_TTL,
+        });
+
+        let response = handle_command(CONFIRM_COMMAND, &mut worker, &config, 1, None, &mut pending);
+
+        assert_eq!(
+            response.as_deref(),
+            Some("Brak zweryfikowanej tożsamości procesu — akcja zablokowana")
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn expired_confirmation_is_rejected_when_consumed() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+        let mut pending = Some(PendingConfirmation {
+            action: PendingAction::Router {
+                action: router::Action::CleanCache,
+                identity: None,
+            },
+            expires_at: Instant::now() - Duration::from_secs(1),
+        });
+
+        let response = handle_command(CONFIRM_COMMAND, &mut worker, &config, 1, None, &mut pending);
+
+        assert_eq!(
+            response.as_deref(),
+            Some("Potwierdzenie wygasło — akcja nie została wykonana")
+        );
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn normal_command_replaces_pending_confirmation_and_cancel_clears_it() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+        let mut pending = Some(PendingConfirmation {
+            action: PendingAction::Router {
+                action: router::Action::Kill("old-target".to_owned()),
+                identity: None,
+            },
+            expires_at: Instant::now() + CONFIRMATION_TTL,
+        });
+
+        let _ = handle_command("status", &mut worker, &config, 1, None, &mut pending);
+        assert!(pending.is_none());
+
+        pending = Some(PendingConfirmation {
+            action: PendingAction::Router {
+                action: router::Action::CleanCache,
+                identity: None,
+            },
+            expires_at: Instant::now() + CONFIRMATION_TTL,
+        });
+        let response = handle_command(CANCEL_COMMAND, &mut worker, &config, 2, None, &mut pending);
+        assert_eq!(response.as_deref(), Some("Anulowano oczekującą akcję"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
     fn display_state_copies_telemetry_and_alerts() {
         let mut alerts = BTreeMap::new();
         alerts.insert(
@@ -524,6 +1019,16 @@ mod tests {
         assert_eq!(banner.text, "done");
         assert!(!banner.is_expired(created_at + COMMAND_RESPONSE_TTL - Duration::from_millis(1)));
         assert!(banner.is_expired(created_at + COMMAND_RESPONSE_TTL));
+    }
+
+    #[test]
+    fn confirmation_banner_remains_visible_for_backend_confirmation_ttl() {
+        let created_at = Instant::now();
+        let banner = CommandBanner::new("POTWIERDZENIE: kill\n...".to_owned(), created_at);
+
+        assert!(!banner.is_expired(created_at + COMMAND_RESPONSE_TTL));
+        assert!(!banner.is_expired(created_at + CONFIRMATION_TTL - Duration::from_millis(1)));
+        assert!(banner.is_expired(created_at + CONFIRMATION_TTL));
     }
 
     #[test]
@@ -580,11 +1085,120 @@ mod tests {
     }
 
     #[test]
+    fn alert_termination_requires_explicit_confirmation() {
+        let mut alerts = BTreeMap::from([(
+            42,
+            Alert {
+                pid: 42,
+                process_name: "cargo".to_owned(),
+                message: "frozen".to_owned(),
+                actions: vec![AlertAction::Terminate],
+            },
+        )]);
+        let identity = snapshot().processes[0].identity();
+        let mut targets = BTreeMap::from([(42, identity)]);
+        let mut pending = None;
+
+        let response = handle_user_action(
+            UserAction::Terminate(42),
+            Some(&snapshot()),
+            &Config::default(),
+            &mut alerts,
+            &mut targets,
+            &mut pending,
+        );
+
+        assert!(
+            response
+                .as_deref()
+                .is_some_and(|text| text.starts_with("POTWIERDZENIE:"))
+        );
+        assert!(pending.is_some());
+        assert!(alerts.contains_key(&42));
+    }
+
+    #[test]
+    fn alert_confirmation_identifies_process_by_name_and_pid() {
+        let mut alerts = BTreeMap::from([(
+            42,
+            Alert {
+                pid: 42,
+                process_name: "cargo".to_owned(),
+                message: "frozen".to_owned(),
+                actions: vec![AlertAction::Terminate],
+            },
+        )]);
+        let mut targets = BTreeMap::from([(42, snapshot().processes[0].identity())]);
+        let mut pending = None;
+
+        let response = confirm_alert_termination(
+            snapshot().processes[0].identity(),
+            Some(&snapshot()),
+            &mut alerts,
+            &mut targets,
+            &mut pending,
+        );
+
+        assert!(response.contains("'cargo' (PID 42)"));
+    }
+
+    #[test]
+    fn alert_confirmation_rejects_changed_identity() {
+        let original = snapshot();
+        let mut changed = original.clone();
+        changed.processes[0].start_time += 1;
+        let identity = original.processes[0].identity();
+        let mut alerts = BTreeMap::from([(
+            42,
+            Alert {
+                pid: 42,
+                process_name: "cargo".to_owned(),
+                message: "frozen".to_owned(),
+                actions: vec![AlertAction::Terminate],
+            },
+        )]);
+        let mut targets = BTreeMap::from([(42, identity)]);
+        let mut pending = None;
+
+        let response = confirm_alert_termination(
+            original.processes[0].identity(),
+            Some(&changed),
+            &mut alerts,
+            &mut targets,
+            &mut pending,
+        );
+
+        assert_eq!(
+            response,
+            "Tożsamość procesu zmieniła się — akcja zablokowana"
+        );
+        assert!(pending.is_none());
+        assert!(!alerts.contains_key(&42));
+    }
+
+    #[test]
     fn resume_only_sends_sigcont() {
         assert_eq!(
             user_action_guard_actions(UserAction::Resume(42)),
             vec![GuardAction::Thaw { pid: 42 }]
         );
+    }
+
+    #[test]
+    fn resume_cancels_pending_destructive_confirmation() {
+        let mut pending = Some(PendingConfirmation {
+            action: PendingAction::Router {
+                action: router::Action::CleanCache,
+                identity: None,
+            },
+            expires_at: Instant::now() + CONFIRMATION_TTL,
+        });
+
+        assert!(cancel_pending_for_resume(
+            UserAction::Resume(42),
+            &mut pending
+        ));
+        assert!(pending.is_none());
     }
 
     #[test]

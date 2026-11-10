@@ -1,4 +1,5 @@
-use egui::{Color32, RichText, Sense, vec2};
+use egui::vec2;
+use egui::{Color32, RichText, Sense};
 
 use crate::{DisplayState, SystemState};
 
@@ -39,7 +40,7 @@ fn pct(used: u64, total: u64) -> f64 {
 fn mem_text(label: &str, used: u64, total: u64, yellow_pct: f32, red_pct: f32) -> RichText {
     let p = pct(used, total);
     RichText::new(format!(
-        "{label}: {:.1}/{:.1} GB ({:.0}%)",
+        "{label}: {:.1}/{:.1} GiB ({:.0}%)",
         used as f64 / GIB,
         total as f64 / GIB,
         p
@@ -60,7 +61,13 @@ fn cpu_color(state: &DisplayState) -> Option<Color32> {
 pub fn draw_status_bar(ui: &mut egui::Ui, state: &DisplayState) {
     ui.horizontal_wrapped(|ui| {
         let size = ui.text_style_height(&egui::TextStyle::Body);
-        let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+        let telemetry_hint = if state.telemetry_available {
+            "Telemetry: available"
+        } else {
+            "Telemetry: waiting for sentinel"
+        };
+        response.on_hover_text(telemetry_hint);
         ui.painter().circle_filled(
             rect.center(),
             size * 0.4,
@@ -107,7 +114,8 @@ pub fn draw_status_bar(ui: &mut egui::Ui, state: &DisplayState) {
                 state.thresholds.vram_yellow_pct,
                 state.thresholds.vram_red_pct,
             )),
-            _ => ui.label(RichText::new("VRAM: N/A").weak()),
+            (false, _, _) => ui.label(RichText::new("VRAM: waiting").weak()),
+            (true, _, _) => ui.label(RichText::new("VRAM: unavailable").weak()),
         };
         ui.label("|");
         let (guard_label, guard_color) = if !state.telemetry_available {
@@ -163,6 +171,14 @@ mod tests {
         assert_eq!(
             state_color(SystemState::Red),
             Color32::from_rgb(244, 67, 54)
+        );
+    }
+
+    #[test]
+    fn memory_text_uses_binary_gib_label() {
+        assert_eq!(
+            mem_text("RAM", GIB as u64, (2.0 * GIB) as u64, 75.0, 88.0).text(),
+            "RAM: 1.0/2.0 GiB (50%)"
         );
     }
 }

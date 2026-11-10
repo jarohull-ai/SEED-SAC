@@ -41,6 +41,21 @@ pub fn execute(action: &Action) -> ExecResult {
 /// This is useful to callers that already loaded configuration and to tests;
 /// the public convenience entry point [`execute`] loads the normal config.
 pub fn execute_with_config(action: &Action, config: &Config) -> ExecResult {
+    if matches!(action, Action::Kill(_) | Action::CleanCache) {
+        return ExecResult::Error(
+            "Akcja destrukcyjna wymaga jawnego potwierdzenia (execute_confirmed_with_config)"
+                .to_owned(),
+        );
+    }
+    execute_confirmed_with_config(action, config)
+}
+
+/// Execute an action after the caller has obtained an explicit confirmation.
+///
+/// This entry point is intentionally separate from [`execute_with_config`]:
+/// callers cannot accidentally turn a normal router dispatch into a
+/// destructive operation merely by passing a parsed action through it.
+pub fn execute_confirmed_with_config(action: &Action, config: &Config) -> ExecResult {
     match action {
         Action::Kill(name) => signal(name, "Zamknięto", |pid| GuardAction::Kill { pid }, config),
         Action::Freeze(name) => {
@@ -65,8 +80,16 @@ fn signal(
         ));
     }
 
-    let Some(target) = find_pid(name) else {
-        return ExecResult::Error(format!("Nie znaleziono procesu o nazwie {name}"));
+    let target = match find_pid(name) {
+        Ok(target) => target,
+        Err(ProcessLookupError::NotFound) => {
+            return ExecResult::Error(format!("Nie znaleziono procesu o nazwie {name}"));
+        }
+        Err(ProcessLookupError::Ambiguous { matches }) => {
+            return ExecResult::Error(format!(
+                "Nie można jednoznacznie wybrać procesu o nazwie {name} — znaleziono {matches} procesy"
+            ));
+        }
     };
     let pid = target.pid;
     let resolved = target.name.clone();
@@ -94,7 +117,7 @@ fn signal(
         name: target.name.clone(),
         start_time: target.start_time,
     };
-    match guard::execute_for(&make_action(pid), &identity) {
+    match guard::execute_for(&make_action(pid), &identity, config) {
         Ok(()) => {
             tracing::debug!(pid, process = %resolved, action = verb, "router executed process action");
             ExecResult::Done(format!("{verb} {resolved} (PID {pid})"))
@@ -109,8 +132,8 @@ fn signal(
 ///
 /// Destructive actions must never infer a target from a substring: doing so
 /// could select an unrelated process (or bypass an immune-name check). If
-/// several processes have the same executable name, prefer the largest one as
-/// a deterministic tie-breaker.
+/// several processes have the same executable name, reject the lookup rather
+/// than guessing which process the user intended.
 ///
 /// Returns the PID together with the process name as reported by the kernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,35 +143,40 @@ struct ProcessTarget {
     start_time: u64,
 }
 
-fn find_pid(name: &str) -> Option<ProcessTarget> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessLookupError {
+    NotFound,
+    Ambiguous { matches: usize },
+}
+
+fn find_pid(name: &str) -> Result<ProcessTarget, ProcessLookupError> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
 
     let needle = name.trim().to_lowercase();
     if needle.is_empty() {
-        return None;
+        return Err(ProcessLookupError::NotFound);
     }
 
-    let mut exact: Option<(ProcessTarget, u64)> = None;
+    let mut exact = Vec::new();
 
     for (pid, process) in system.processes() {
         let process_name = process.name().to_string_lossy().into_owned();
         let lowered = process_name.to_lowercase();
-        let rss = process.memory();
-
-        if lowered == needle && exact.as_ref().is_none_or(|(_, best_rss)| rss > *best_rss) {
-            exact = Some((
-                ProcessTarget {
-                    pid: pid.as_u32(),
-                    name: process_name,
-                    start_time: process.start_time(),
-                },
-                rss,
-            ));
+        if lowered == needle {
+            exact.push(ProcessTarget {
+                pid: pid.as_u32(),
+                name: process_name,
+                start_time: process.start_time(),
+            });
         }
     }
 
-    exact.map(|(target, _)| target)
+    match exact.len() {
+        0 => Err(ProcessLookupError::NotFound),
+        1 => Ok(exact.pop().expect("length checked above")),
+        matches => Err(ProcessLookupError::Ambiguous { matches }),
+    }
 }
 
 /// Re-check the PID's kernel identity immediately before sending a signal.
@@ -164,6 +192,16 @@ fn target_is_current(target: &ProcessTarget) -> bool {
 
 /// Synchronise file systems and drop the page cache.
 fn clean_cache() -> ExecResult {
+    // Check authorization before syncing: a denied request must not perform
+    // even the preparatory system-wide sync as a side effect.
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .open("/proc/sys/vm/drop_caches")
+    {
+        Ok(file) => file,
+        Err(err) => return cache_error(&err),
+    };
+
     let status = match Command::new("/usr/bin/sync").status() {
         Ok(status) => status,
         Err(err) => {
@@ -175,14 +213,6 @@ fn clean_cache() -> ExecResult {
             "Synchronizacja dysku zakończyła się niepowodzeniem: {status}"
         ));
     }
-
-    let mut file = match OpenOptions::new()
-        .write(true)
-        .open("/proc/sys/vm/drop_caches")
-    {
-        Ok(file) => file,
-        Err(err) => return cache_error(&err),
-    };
 
     match file.write_all(b"3") {
         Ok(()) => ExecResult::Done("Wyczyszczono cache pamięci (drop_caches=3)".to_owned()),
@@ -221,7 +251,6 @@ mod tests {
         let name = "seed-sac-missing-process-xyz";
 
         for action in [
-            Action::Kill(name.to_owned()),
             Action::Freeze(name.to_owned()),
             Action::Resume(name.to_owned()),
         ] {
@@ -235,10 +264,7 @@ mod tests {
     #[test]
     fn clean_cache_reports_a_result() {
         match execute(&Action::CleanCache) {
-            ExecResult::Done(message) => assert!(message.contains("cache")),
-            ExecResult::Error(message) => {
-                assert!(message.contains("uprawnie") || message.contains("cache"));
-            }
+            ExecResult::Error(message) => assert!(message.contains("jawnego potwierdzenia")),
             other => panic!("unexpected CleanCache result: {other:?}"),
         }
     }
@@ -255,10 +281,15 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        let target = found.expect("sleep process should be visible");
-        assert!(target.pid > 0);
-        assert_eq!(target.name.to_lowercase(), "sleep");
-        assert!(target.start_time > 0);
+        match found {
+            Ok(target) => {
+                assert!(target.pid > 0);
+                assert_eq!(target.name.to_lowercase(), "sleep");
+                assert!(target.start_time > 0);
+            }
+            Err(ProcessLookupError::Ambiguous { matches }) => assert!(matches >= 2),
+            Err(error) => panic!("sleep process should be visible: {error:?}"),
+        }
     }
 
     #[test]
@@ -273,7 +304,10 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
 
-        assert!(found.is_some());
+        assert!(matches!(
+            found,
+            Ok(_) | Err(ProcessLookupError::Ambiguous { matches: 2.. })
+        ));
     }
 
     #[test]
@@ -284,7 +318,7 @@ mod tests {
             .expect("spawn sleep child");
         std::thread::sleep(Duration::from_millis(100));
 
-        assert!(find_pid("lee").is_none());
+        assert_eq!(find_pid("lee"), Err(ProcessLookupError::NotFound));
 
         let _ = child.kill();
         let _ = child.wait();
@@ -302,10 +336,37 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        match execute_with_config(&Action::Kill(current_name), &Config::default()) {
+        match execute_confirmed_with_config(&Action::Kill(current_name), &Config::default()) {
             ExecResult::Error(message) => assert!(message.contains("własnym procesie")),
             other => panic!("current process must be protected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unconfirmed_destructive_actions_are_rejected_before_side_effects() {
+        let config = Config::default();
+
+        assert!(matches!(
+            execute_with_config(&Action::Kill("sleep".to_owned()), &config),
+            ExecResult::Error(message) if message.contains("jawnego potwierdzenia")
+        ));
+        assert!(matches!(
+            execute_with_config(&Action::CleanCache, &config),
+            ExecResult::Error(message) if message.contains("jawnego potwierdzenia")
+        ));
+    }
+
+    #[test]
+    fn confirmed_kill_uses_the_destructive_entry_point() {
+        let result = execute_confirmed_with_config(
+            &Action::Kill("seed-sac-missing-process-xyz".to_owned()),
+            &Config::default(),
+        );
+
+        assert!(matches!(
+            result,
+            ExecResult::Error(message) if message.contains("Nie znaleziono procesu")
+        ));
     }
 
     #[test]
@@ -314,8 +375,31 @@ mod tests {
         config.guard.immune_process_names = vec!["sleep".to_owned()];
 
         assert!(matches!(
-            execute_with_config(&Action::Kill("sleep-worker".to_owned()), &config),
+            execute_confirmed_with_config(&Action::Kill("sleep-worker".to_owned()), &config),
             ExecResult::Error(message) if message.contains("Nie znaleziono procesu")
         ));
+    }
+
+    #[test]
+    fn duplicate_process_names_are_rejected_instead_of_guessed() {
+        let mut first = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn first sleep child");
+        let mut second = Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn second sleep child");
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(matches!(
+            find_pid("sleep"),
+            Err(ProcessLookupError::Ambiguous { matches }) if matches >= 2
+        ));
+
+        let _ = first.kill();
+        let _ = second.kill();
+        let _ = first.wait();
+        let _ = second.wait();
     }
 }

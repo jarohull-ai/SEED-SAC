@@ -28,7 +28,7 @@ pub(crate) fn immutable_process_names() -> &'static [&'static str] {
 
 /// Top-level configuration tree.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub sentinel: SentinelConfig,
     pub thresholds: ThresholdsConfig,
@@ -38,7 +38,7 @@ pub struct Config {
 
 /// Configuration for the local-first L1 model provider.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct L1ProviderConfig {
     pub enabled: bool,
     pub backend: String,
@@ -81,7 +81,7 @@ impl L1ProviderConfig {
 
 /// Sampler tuning.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SentinelConfig {
     pub poll_interval_ms: u64,
 }
@@ -96,7 +96,7 @@ impl Default for SentinelConfig {
 
 /// Thresholds that map a snapshot onto a [`crate::SystemState`].
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ThresholdsConfig {
     pub ram: RamThresholds,
     pub cpu: CpuThresholds,
@@ -104,7 +104,7 @@ pub struct ThresholdsConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RamThresholds {
     pub yellow_pct: f32,
     pub red_pct: f32,
@@ -121,7 +121,7 @@ impl Default for RamThresholds {
 
 /// CPU pressure only has a yellow level; it never escalates to red on its own.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CpuThresholds {
     pub yellow_pct: f32,
 }
@@ -133,7 +133,7 @@ impl Default for CpuThresholds {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VramThresholds {
     pub yellow_pct: f32,
     pub red_pct: f32,
@@ -148,9 +148,41 @@ impl Default for VramThresholds {
     }
 }
 
+impl Config {
+    /// Validate safety-sensitive values before they are used by the sentinel.
+    ///
+    /// Invalid user configuration is rejected as a whole by [`load`], so the
+    /// caller cannot accidentally run with a partially invalid policy.
+    fn validated(mut self) -> Option<Self> {
+        let ram = &self.thresholds.ram;
+        let cpu = &self.thresholds.cpu;
+        let vram = &self.thresholds.vram;
+
+        if !ordered_percentages(ram.yellow_pct, ram.red_pct)
+            || !valid_percentage(cpu.yellow_pct)
+            || !ordered_percentages(vram.yellow_pct, vram.red_pct)
+            || !self.guard.ram_spike_mb_per_sec.is_finite()
+            || self.guard.ram_spike_mb_per_sec < 0.0
+        {
+            return None;
+        }
+
+        self.l1_provider = self.l1_provider.validated();
+        Some(self)
+    }
+}
+
+fn valid_percentage(value: f32) -> bool {
+    value.is_finite() && (0.0..=100.0).contains(&value)
+}
+
+fn ordered_percentages(yellow: f32, red: f32) -> bool {
+    valid_percentage(yellow) && valid_percentage(red) && yellow <= red
+}
+
 /// Mitigation behaviour.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct GuardConfig {
     pub ram_spike_mb_per_sec: f32,
     #[serde(
@@ -193,10 +225,16 @@ pub fn load() -> Config {
     };
 
     match toml::from_str::<Config>(&contents) {
-        Ok(mut config) => {
-            config.l1_provider = config.l1_provider.validated();
-            config
-        }
+        Ok(config) => match config.validated() {
+            Some(config) => config,
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "invalid sentinel thresholds, using defaults"
+                );
+                Config::default()
+            }
+        },
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -223,7 +261,13 @@ fn config_path() -> Option<PathBuf> {
 #[serde(untagged)]
 enum ImmuneNames {
     List(Vec<String>),
-    Table { names: Vec<String> },
+    Table(ImmuneNamesTable),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImmuneNamesTable {
+    names: Vec<String>,
 }
 
 fn deserialize_immune_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
@@ -232,7 +276,7 @@ where
 {
     Ok(match ImmuneNames::deserialize(deserializer)? {
         ImmuneNames::List(names) => names,
-        ImmuneNames::Table { names } => names,
+        ImmuneNames::Table(table) => table.names,
     })
 }
 
@@ -336,5 +380,58 @@ mod tests {
     fn accepts_flat_immune_list() {
         let config: Config = toml::from_str("[guard]\nimmune_process_names = [\"sac\"]\n").unwrap();
         assert_eq!(config.guard.immune_process_names, ["sac"]);
+    }
+
+    #[test]
+    fn rejects_unknown_config_fields() {
+        for source in [
+            "[sentinel]\npoll_interva_ms = 1000\n",
+            "[thresholds.ram]\nyellow_pct = 70.0\nred_pcc = 85.0\n",
+            "[l1_provider]\nmodle = \"custom-model\"\n",
+            "[guard.immune_processes]\nnamse = [\"sac\"]\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(source).is_err(),
+                "accepted typo: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_accepts_defaults_and_valid_custom_thresholds() {
+        assert!(Config::default().validated().is_some());
+
+        let mut config = Config::default();
+        config.thresholds.ram.yellow_pct = 0.0;
+        config.thresholds.ram.red_pct = 100.0;
+        config.thresholds.cpu.yellow_pct = 100.0;
+        config.thresholds.vram.yellow_pct = 0.0;
+        config.thresholds.vram.red_pct = 100.0;
+        config.guard.ram_spike_mb_per_sec = 0.0;
+        assert!(config.validated().is_some());
+    }
+
+    #[test]
+    fn validation_rejects_invalid_thresholds_and_spike_rate() {
+        let mut config = Config::default();
+
+        config.thresholds.ram.yellow_pct = 90.0;
+        config.thresholds.ram.red_pct = 89.0;
+        assert!(config.clone().validated().is_none());
+
+        config = Config::default();
+        config.thresholds.cpu.yellow_pct = f32::NAN;
+        assert!(config.clone().validated().is_none());
+
+        config = Config::default();
+        config.thresholds.vram.red_pct = 101.0;
+        assert!(config.clone().validated().is_none());
+
+        config = Config::default();
+        config.guard.ram_spike_mb_per_sec = -1.0;
+        assert!(config.clone().validated().is_none());
+
+        config.guard.ram_spike_mb_per_sec = f32::INFINITY;
+        assert!(config.validated().is_none());
     }
 }
