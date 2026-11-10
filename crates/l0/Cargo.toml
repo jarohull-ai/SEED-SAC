@@ -5,3 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+
+[features]
+default = ["heuristic"]
+heuristic = []
+onnx = []

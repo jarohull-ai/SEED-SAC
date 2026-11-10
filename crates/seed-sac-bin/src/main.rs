@@ -450,7 +450,7 @@ fn handle_command(
     snapshot: Option<&SystemSnapshot>,
     pending_confirmation: &mut Option<PendingConfirmation>,
 ) -> Option<String> {
-    let action = router::parse(text);
+    // Handle confirmation/cancellation commands first (no L0 classification needed)
     if text.trim() == CONFIRM_COMMAND {
         let Some(pending) = pending_confirmation.take() else {
             return Some("Brak oczekującej akcji do potwierdzenia".to_owned());
@@ -466,6 +466,30 @@ fn handle_command(
         }
         return Some("Brak oczekującej akcji do anulowania".to_owned());
     }
+
+    // Triage: L0 intent classification for regular commands
+    let classifier = l0::IntentClassifier::new(l0::ClassifierConfig::default());
+    let intent = classifier.classify(text);
+
+    match &intent {
+        l0::Intent::Unknown { .. } => {
+            pending_confirmation.take();
+            return Some(
+                "Nie zrozumiałem polecenia.\nSpróbuj: 'kill <process>', 'why is CPU high?'"
+                    .to_owned(),
+            );
+        }
+        l0::Intent::Analysis { .. } => {
+            pending_confirmation.take();
+            return Some("L1: oczekiwanie na lokalny model…".to_owned());
+        }
+        l0::Intent::Command { .. } => {
+            // Fall through to grammar parser
+        }
+    }
+
+    // For Command intent, parse and execute via grammar
+    let action = router::parse(text);
     if is_destructive(&action) {
         let description = confirmation_description(&action);
         let identity = match &action {

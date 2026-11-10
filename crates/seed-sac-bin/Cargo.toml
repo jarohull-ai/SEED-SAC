@@ -8,6 +8,7 @@ name = "sac"
 path = "src/main.rs"
 
 [dependencies]
+l0 = { path = "../l0" }
 sentinel = { path = "../sentinel" }
 hud = { path = "../hud" }
 router = { path = "../router" }

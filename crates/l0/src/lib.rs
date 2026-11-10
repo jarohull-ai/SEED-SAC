@@ -5,8 +5,11 @@
 //! - **Analysis**: Requests requiring LLM context (escalated to L1/LM Studio with DLP sanitization)
 //! - **Unknown**: Ambiguous intent (prompts user to clarify via HUD)
 //!
-//! All classification happens in <1ms, ensuring zero perceptible latency on the HUD thread.
+//! All classification happens in <10ms, ensuring minimal latency on the HUD thread.
 
+pub mod backend;
+
+use backend::{ClassificationBackend, HeuristicBackend};
 use std::fmt;
 
 /// Intent classification result from L0.
@@ -89,77 +92,29 @@ impl Default for ClassifierConfig {
 pub struct IntentClassifier {
     #[allow(dead_code)]
     config: ClassifierConfig,
+    backend: Box<dyn ClassificationBackend>,
 }
 
 impl IntentClassifier {
     /// Create a new intent classifier with the given configuration.
     pub fn new(config: ClassifierConfig) -> Self {
-        Self { config }
+        // For now, always use heuristic backend (ONNX support via feature flag in future)
+        let backend: Box<dyn ClassificationBackend> = Box::new(HeuristicBackend);
+        Self { config, backend }
     }
 
     /// Classify user input string into an Intent.
     ///
     /// # Performance Guarantee
-    /// Classification completes in <1ms (regex-only) or <10ms (with model inference).
+    /// Classification completes in <10ms (heuristic) or with model inference via backend.
     pub fn classify(&self, input: &str) -> Intent {
-        let trimmed = input.trim().to_lowercase();
+        let (intent, latency_ms) = self.backend.classify(input);
 
-        // Stage 2.0: Regex-based fallback (deterministic, <1ms)
-        self.classify_by_regex(&trimmed)
-            .unwrap_or_else(|reason| Intent::Unknown {
-                input: input.to_owned(),
-                reason,
-            })
-    }
-
-    /// Classify using regex patterns (fallback for Stage 2.0).
-    fn classify_by_regex(&self, input: &str) -> Result<Intent, String> {
-        // Command patterns: "kill <process>", "drop caches", "resume <pid>"
-        if let Some(target) = input.strip_prefix("kill ") {
-            let subject = target.trim().to_owned();
-            if subject.is_empty() {
-                return Err("kill: missing process name".to_owned());
-            }
-            return Ok(Intent::Command {
-                verb: "kill".to_owned(),
-                subject: Some(subject),
-            });
+        if self.config.verbose {
+            eprintln!("[L0] {} (latency: {:.2}ms)", intent, latency_ms);
         }
 
-        if input.starts_with("drop") || input.contains("drop_caches") {
-            return Ok(Intent::Command {
-                verb: "drop_caches".to_owned(),
-                subject: None,
-            });
-        }
-
-        if let Some(target) = input.strip_prefix("resume ") {
-            let subject = target.trim().to_owned();
-            if subject.is_empty() {
-                return Err("resume: missing PID".to_owned());
-            }
-            return Ok(Intent::Command {
-                verb: "resume".to_owned(),
-                subject: Some(subject),
-            });
-        }
-
-        // Analysis patterns: question marks, "what", "how", "why", "explain"
-        if input.contains('?')
-            || input.starts_with("what ")
-            || input.starts_with("how ")
-            || input.starts_with("why ")
-            || input.starts_with("explain ")
-            || input.starts_with("tell me ")
-        {
-            let topic = input.chars().take(50).collect::<String>();
-            return Ok(Intent::Analysis {
-                topic,
-                ambiguity_score: 50, // Default confidence for regex-only
-            });
-        }
-
-        Err("no matching pattern".to_owned())
+        intent
     }
 }
 
@@ -242,5 +197,86 @@ mod tests {
             ambiguity_score: 45,
         };
         assert_eq!(analysis.to_string(), "Analysis: memory (ambiguity: 45%)");
+    }
+
+    #[test]
+    fn test_command_kill_polish() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("ubij chrome");
+        match result {
+            Intent::Command { verb, subject } => {
+                assert_eq!(verb, "kill");
+                assert_eq!(subject.as_deref(), Some("chrome"));
+            }
+            _ => panic!("expected Command intent"),
+        }
+    }
+
+    #[test]
+    fn test_command_freeze() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("freeze firefox");
+        match result {
+            Intent::Command { verb, subject } => {
+                assert_eq!(verb, "freeze");
+                assert_eq!(subject.as_deref(), Some("firefox"));
+            }
+            _ => panic!("expected Command intent"),
+        }
+    }
+
+    #[test]
+    fn test_command_freeze_polish() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("zamroź cargo");
+        match result {
+            Intent::Command { verb, subject } => {
+                assert_eq!(verb, "freeze");
+                assert_eq!(subject.as_deref(), Some("cargo"));
+            }
+            _ => panic!("expected Command intent"),
+        }
+    }
+
+    #[test]
+    fn test_command_pause() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("pause java");
+        match result {
+            Intent::Command { verb, subject } => {
+                assert_eq!(verb, "freeze");
+                assert_eq!(subject.as_deref(), Some("java"));
+            }
+            _ => panic!("expected Command intent"),
+        }
+    }
+
+    #[test]
+    fn test_analysis_dlaczego() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("dlaczego CPU jest wysoki?");
+        assert!(result.requires_l1());
+        assert!(!result.requires_clarification());
+    }
+
+    #[test]
+    fn test_analysis_wyjasnij() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("wyjaśnij zmiany VRAM");
+        assert!(result.requires_l1());
+    }
+
+    #[test]
+    fn test_analysis_how() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("How much memory is used?");
+        assert!(result.requires_l1());
+    }
+
+    #[test]
+    fn test_command_drop_caches_variant() {
+        let classifier = IntentClassifier::new(ClassifierConfig::default());
+        let result = classifier.classify("czyszcz cache");
+        assert!(matches!(result, Intent::Command { verb, .. } if verb == "drop_caches"));
     }
 }
