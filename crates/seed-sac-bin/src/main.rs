@@ -27,7 +27,7 @@ use hud::{
 };
 use memory::{EventType, EventWriter, SystemEvent};
 use router::executor::ExecResult;
-use router::l1_client::{L1Client, L1Config, L1Error};
+use router::l1_client::{L1Client, L1Config};
 use sentinel::config::Config;
 use sentinel::guard::{self, GuardAction};
 use sentinel::process::ProcessTracker;
@@ -303,9 +303,35 @@ fn run_sentinel(
             next_sample_at = Instant::now() + poll_interval;
         }
 
-        while let Some((generation, response)) = l1_worker.try_response() {
+        while let Some((generation, response, redaction_occurred)) = l1_worker.try_response() {
+            if redaction_occurred {
+                if let Some(writer) = &event_writer {
+                    let event = SystemEvent {
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                        event_type: EventType::DLPRedactionApplied,
+                        target_pid: None,
+                        process_name: None,
+                        ram_usage_mb: None,
+                        cpu_usage_pct: None,
+                        vram_usage_mb: None,
+                        details: Some("sensitive data redacted before L1 submission".to_owned()),
+                    };
+                    let _ = writer.record(event);
+                }
+            }
             if generation == command_generation {
-                banner = Some(CommandBanner::new(response, Instant::now()));
+                let response_with_dlp = if redaction_occurred {
+                    format!(
+                        "[DLP] Zanonimizowano wrażliwe dane przed wysłaniem do L1\n{}",
+                        response
+                    )
+                } else {
+                    response
+                };
+                banner = Some(CommandBanner::new(response_with_dlp, Instant::now()));
             }
         }
 
@@ -619,13 +645,13 @@ fn execute_confirmed_command_action(
 /// while LM Studio is starting or timing out.
 struct L1Worker {
     request_tx: SyncSender<(u64, String)>,
-    response_rx: Receiver<(u64, String)>,
+    response_rx: Receiver<(u64, String, bool)>,
 }
 
 impl L1Worker {
     fn spawn(config: &Config) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<(u64, String)>(4);
-        let (response_tx, response_rx) = mpsc::channel::<(u64, String)>();
+        let (response_tx, response_rx) = mpsc::channel::<(u64, String, bool)>();
         let provider = config.l1_provider.clone().validated();
         thread::Builder::new()
             .name("l1-client".to_owned())
@@ -644,12 +670,18 @@ impl L1Worker {
                     None
                 };
                 while let Ok((generation, prompt)) = request_rx.recv() {
-                    let response = client
-                        .as_ref()
-                        .map(|client| client.complete(&prompt))
-                        .unwrap_or(Err(L1Error::Offline));
-                    let response = map_l1_response(response);
-                    if response_tx.send((generation, response)).is_err() {
+                    let (response, redaction_occurred) =
+                        match client.as_ref().map(|c| c.complete(&prompt)) {
+                            Some(Ok((content, dlp_report))) => {
+                                let redacted = dlp_report.redaction_count > 0;
+                                (content, redacted)
+                            }
+                            Some(Err(_)) | None => (L1_OFFLINE_MESSAGE.to_owned(), false),
+                        };
+                    if response_tx
+                        .send((generation, response, redaction_occurred))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -670,13 +702,9 @@ impl L1Worker {
         }
     }
 
-    fn try_response(&self) -> Option<(u64, String)> {
+    fn try_response(&self) -> Option<(u64, String, bool)> {
         self.response_rx.try_recv().ok()
     }
-}
-
-fn map_l1_response(response: Result<String, L1Error>) -> String {
-    response.unwrap_or_else(|_| L1_OFFLINE_MESSAGE.to_owned())
 }
 
 /// A router reply waiting to be shown in the HUD until a wall-clock deadline.
@@ -1331,15 +1359,6 @@ mod tests {
     }
 
     #[test]
-    fn l1_offline_mapping_does_not_expose_client_details() {
-        assert_eq!(map_l1_response(Err(L1Error::Timeout)), L1_OFFLINE_MESSAGE);
-        assert_eq!(
-            map_l1_response(Err(L1Error::Offline)),
-            "L1 offline (LM Studio niedostępne na porcie 1234)"
-        );
-    }
-
-    #[test]
     fn l1_handoff_is_nonblocking_when_provider_is_disabled() {
         let mut config = Config::default();
         config.l1_provider.enabled = false;
@@ -1351,7 +1370,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         let deadline = Instant::now() + Duration::from_secs(1);
         let response = loop {
-            if let Some((_, response)) = worker.try_response() {
+            if let Some((_, response, _)) = worker.try_response() {
                 break response;
             }
             assert!(Instant::now() < deadline, "L1 worker did not respond");

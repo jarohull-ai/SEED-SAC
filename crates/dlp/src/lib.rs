@@ -320,13 +320,17 @@ fn scan_passwords(text: &str, violations: &mut Vec<DLPViolation>) {
         while let Some(rel_start) = text[search_from..].find(prefix) {
             let start = search_from + rel_start;
             let val_start = start + prefix.len();
-            let val_len = text[val_start..]
-                .chars()
-                .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
-                .count();
+            let val_slice = &text[val_start..];
 
-            if val_len > 0 {
-                let end = val_start + val_len;
+            let mut end = val_start;
+            for (byte_offset, ch) in val_slice.char_indices() {
+                if ch.is_whitespace() || ch == '"' || ch == '\'' {
+                    break;
+                }
+                end = val_start + byte_offset + ch.len_utf8();
+            }
+
+            if end > val_start {
                 violations.push(DLPViolation {
                     rule: SanitizationRule::CommandPassword,
                     pattern: format!("{prefix}*"),
@@ -350,11 +354,16 @@ fn scan_sensitive_paths(text: &str, violations: &mut Vec<DLPViolation>) {
         while let Some(rel_start) = text[search_from..].find(pattern) {
             let start = search_from + rel_start;
             let end = if pattern.ends_with('/') {
-                let path_len = text[start..]
-                    .chars()
-                    .take_while(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
-                    .count();
-                start + path_len
+                let path_start = start;
+                let path_slice = &text[path_start..];
+                let mut path_end = path_start;
+                for (byte_offset, ch) in path_slice.char_indices() {
+                    if ch.is_whitespace() || ch == '"' || ch == '\'' {
+                        break;
+                    }
+                    path_end = path_start + byte_offset + ch.len_utf8();
+                }
+                path_end
             } else {
                 start + pattern.len()
             };
@@ -504,5 +513,35 @@ mod tests {
             "Fast path took too long: {} us",
             elapsed.as_micros()
         );
+    }
+
+    #[test]
+    fn test_utf8_password_and_path_safety() {
+        let filter = DLPFilter::new();
+        let input = "sprawdź hasło --password=zażółć oraz /root/poufny_katalog";
+        let (sanitized, report) = filter.sanitize(input);
+        assert!(!sanitized.contains("zażółć"));
+        assert!(!sanitized.contains("/root/poufny_katalog"));
+        assert!(!report.is_empty());
+    }
+
+    #[test]
+    fn test_utf8_emoji_in_password() {
+        let filter = DLPFilter::new();
+        let input = "db login --password=emoji🔐secret";
+        let (sanitized, violations) = filter.sanitize(input);
+        assert!(sanitized.contains("[REDACTED:PASSWORD]"));
+        assert!(!sanitized.contains("emoji🔐secret"));
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn test_utf8_polish_chars_in_path() {
+        let filter = DLPFilter::new();
+        let input = "backup --dest /root/Poufny_Zawartość";
+        let (sanitized, violations) = filter.sanitize(input);
+        assert!(sanitized.contains("[REDACTED:SENSITIVE_PATH]"));
+        assert!(!sanitized.contains("/root/Poufny_Zawartość"));
+        assert_eq!(violations.len(), 1);
     }
 }

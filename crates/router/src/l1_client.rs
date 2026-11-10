@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use dlp::DLPFilter;
 use serde::Deserialize;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1234/v1";
@@ -75,6 +76,13 @@ impl std::fmt::Display for L1Error {
 
 impl std::error::Error for L1Error {}
 
+/// Report of DLP redactions applied to a prompt.
+#[derive(Debug, Clone, Default)]
+pub struct DLPReport {
+    pub redaction_count: usize,
+    pub rules_applied: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -106,21 +114,34 @@ impl L1Client {
     }
 
     /// Send one prompt to `/chat/completions` and return the first text choice.
-    pub fn complete(&self, prompt: &str) -> Result<String, L1Error> {
+    /// Send prompt to L1 with DLP sanitization. Returns (response, DLP report).
+    pub fn complete(&self, prompt: &str) -> Result<(String, DLPReport), L1Error> {
         if prompt.trim().is_empty() {
             return Err(L1Error::EmptyPrompt);
         }
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err(L1Error::InvalidResponse);
         }
-        let prompt = sanitize_prompt(prompt);
+
+        // Apply DLP sanitization
+        let dlp_filter = DLPFilter::new();
+        let (sanitized, violations) = dlp_filter.sanitize(prompt);
+
+        let dlp_report = DLPReport {
+            redaction_count: violations.len(),
+            rules_applied: violations
+                .iter()
+                .map(|v| v.rule.label().to_owned())
+                .collect(),
+        };
+
         let url = format!(
             "{}/chat/completions",
             self.config.endpoint.trim_end_matches('/')
         );
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": sanitized}],
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": false,
@@ -140,37 +161,17 @@ impl L1Client {
             .limit(MAX_RESPONSE_BYTES)
             .read_json()
             .map_err(|_| L1Error::InvalidResponse)?;
-        parsed
+
+        let content = parsed
             .choices
             .into_iter()
             .next()
             .and_then(|choice| choice.message.content)
-            .filter(|content| !content.trim().is_empty())
-            .ok_or(L1Error::InvalidResponse)
-    }
-}
+            .filter(|c| !c.trim().is_empty())
+            .ok_or(L1Error::InvalidResponse)?;
 
-fn sanitize_prompt(prompt: &str) -> String {
-    prompt
-        .split_whitespace()
-        .map(|word| {
-            if word.starts_with("ghp_")
-                || word.starts_with("password=")
-                || word.starts_with("passwd=")
-            {
-                "[redacted]".to_owned()
-            } else if word.starts_with("/home/") {
-                "[path]".to_owned()
-            } else if word.split('.').count() == 4
-                && word.chars().all(|c| c.is_ascii_digit() || c == '.')
-            {
-                "[ip]".to_owned()
-            } else {
-                word.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        Ok((content, dlp_report))
+    }
 }
 
 fn is_local_endpoint(endpoint: &str) -> bool {
@@ -251,7 +252,8 @@ mod tests {
             api_key: Some("must-not-be-logged".into()),
         })
         .unwrap();
-        assert_eq!(client.complete("ping").unwrap(), "hello locally");
+        let (response, _) = client.complete("ping").unwrap();
+        assert_eq!(response, "hello locally");
         server.join().unwrap();
     }
 
@@ -302,10 +304,30 @@ mod tests {
     }
 
     #[test]
-    fn redacts_sensitive_prompt_fragments() {
-        assert_eq!(
-            sanitize_prompt("use ghp_secret password=hunter2 /home/jaro/file 127.0.0.1"),
-            "use [redacted] [redacted] [path] [ip]"
+    fn sanitizes_prompt_with_dlp_filter() {
+        let (endpoint, server) = local_server(
+            r#"{"choices":[{"message":{"role":"assistant","content":"sanitized response"}}]}"#,
         );
+        let client = L1Client::new(L1Config {
+            endpoint,
+            model: "test-model".into(),
+            max_tokens: 512,
+            temperature: 0.2,
+            timeout: Duration::from_secs(2),
+            api_key: None,
+        })
+        .unwrap();
+        let (response, dlp_report) = client
+            .complete("use ghp_1234567890123456789012345678901 --password=hunter2")
+            .unwrap();
+        assert_eq!(response, "sanitized response");
+        assert_eq!(dlp_report.redaction_count, 2);
+        assert!(dlp_report
+            .rules_applied
+            .contains(&"GitHub Token".to_string()));
+        assert!(dlp_report
+            .rules_applied
+            .contains(&"Command Password".to_string()));
+        server.join().unwrap();
     }
 }

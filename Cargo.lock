@@ -2224,6 +2224,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 name = "router"
 version = "0.2.2"
 dependencies = [
+ "dlp",
  "sentinel",
  "serde",
  "serde_json",
