@@ -139,7 +139,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     running.store(false, Ordering::Release);
 
     // Wait for sentinel to complete (including thaw-on-exit) and gracefully shutdown
-    let writer = sentinel_handle.join().map_err(|_| "sentinel thread panicked")?;
+    let writer = sentinel_handle
+        .join()
+        .map_err(|_| "sentinel thread panicked")?;
     if let Some(w) = writer
         && let Err(err) = w.shutdown()
     {

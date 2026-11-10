@@ -6,6 +6,7 @@ members = [
     "crates/router",
     "crates/memory",
     "crates/l0",
+    "crates/dlp",
     "crates/seed-sac-bin",
 ]
 

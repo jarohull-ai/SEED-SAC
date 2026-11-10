@@ -23,10 +23,7 @@ pub enum Intent {
         ambiguity_score: u8, // 0-100: 0=clear, 100=very ambiguous
     },
     /// Intent could not be reliably determined.
-    Unknown {
-        input: String,
-        reason: String,
-    },
+    Unknown { input: String, reason: String },
 }
 
 impl Intent {
@@ -51,7 +48,10 @@ impl fmt::Display for Intent {
                     write!(f, "Command: {}", verb)
                 }
             }
-            Intent::Analysis { topic, ambiguity_score } => {
+            Intent::Analysis {
+                topic,
+                ambiguity_score,
+            } => {
                 write!(f, "Analysis: {} (ambiguity: {}%)", topic, ambiguity_score)
             }
             Intent::Unknown { input, reason } => {
@@ -87,6 +87,7 @@ impl Default for ClassifierConfig {
 
 /// L0 Intent Classifier — stateless, thread-safe resolver.
 pub struct IntentClassifier {
+    #[allow(dead_code)]
     config: ClassifierConfig,
 }
 
@@ -114,8 +115,8 @@ impl IntentClassifier {
     /// Classify using regex patterns (fallback for Stage 2.0).
     fn classify_by_regex(&self, input: &str) -> Result<Intent, String> {
         // Command patterns: "kill <process>", "drop caches", "resume <pid>"
-        if input.starts_with("kill ") {
-            let subject = input[5..].trim().to_owned();
+        if let Some(target) = input.strip_prefix("kill ") {
+            let subject = target.trim().to_owned();
             if subject.is_empty() {
                 return Err("kill: missing process name".to_owned());
             }
@@ -132,8 +133,8 @@ impl IntentClassifier {
             });
         }
 
-        if input.starts_with("resume ") {
-            let subject = input[7..].trim().to_owned();
+        if let Some(target) = input.strip_prefix("resume ") {
+            let subject = target.trim().to_owned();
             if subject.is_empty() {
                 return Err("resume: missing PID".to_owned());
             }
@@ -173,7 +174,7 @@ mod tests {
         match result {
             Intent::Command { verb, subject } => {
                 assert_eq!(verb, "kill");
-                assert_eq!(subject.as_ref().map(|s| s.as_str()), Some("chrome"));
+                assert_eq!(subject.as_deref(), Some("chrome"));
             }
             _ => panic!("expected Command intent"),
         }
@@ -193,7 +194,7 @@ mod tests {
         match result {
             Intent::Command { verb, subject } => {
                 assert_eq!(verb, "resume");
-                assert_eq!(subject.as_ref().map(|s| s.as_str()), Some("5432"));
+                assert_eq!(subject.as_deref(), Some("5432"));
             }
             _ => panic!("expected Command intent"),
         }
