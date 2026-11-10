@@ -313,7 +313,7 @@ fn scan_aws_keys(text: &str, violations: &mut Vec<DLPViolation>) {
 }
 
 fn scan_passwords(text: &str, violations: &mut Vec<DLPViolation>) {
-    const PREFIXES: &[&str] = &["--password=", "--pwd="];
+    const PREFIXES: &[&str] = &["--password=", "--pwd=", "--passwd="];
 
     for &prefix in PREFIXES {
         let mut search_from = 0;
