@@ -73,8 +73,8 @@ pub struct ClassifierConfig {
     pub use_model: bool,
     /// Path to ONNX model weights (if use_model=true).
     pub model_path: Option<String>,
-    /// Threshold for confidence score (0-100). Below this, intent is Unknown.
-    pub confidence_threshold: u8,
+    /// Threshold for confidence score (0.0-1.0). Below this, intent is Unknown.
+    pub confidence_threshold: f32,
     /// Enable verbose logging of classification decisions.
     pub verbose: bool,
 }
@@ -84,7 +84,7 @@ impl Default for ClassifierConfig {
         Self {
             use_model: false, // Fallback to regex-only in Stage 2.0
             model_path: None,
-            confidence_threshold: 60,
+            confidence_threshold: 0.65,
             verbose: false,
         }
     }
@@ -107,7 +107,10 @@ impl IntentClassifier {
                 .clone()
                 .map(Into::into)
                 .unwrap_or_else(OnnxBackend::default_model_path);
-            Box::new(OnnxBackend::new(model_path))
+            Box::new(OnnxBackend::with_confidence_threshold(
+                model_path,
+                config.confidence_threshold,
+            ))
         } else {
             Box::new(HeuristicBackend)
         };

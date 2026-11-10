@@ -34,6 +34,17 @@ names = [
     "sac"  # The SAC process itself
 ]
 
+# L0 intent classification
+[l0]
+# Disabled by default; deterministic heuristics remain the fallback.
+use_model = false
+
+# Empty uses $XDG_DATA_HOME/seed-sac/models/intent.onnx.
+model_path = ""
+
+# Model predictions below this probability are treated as Unknown.
+confidence_threshold = 0.65
+
 # L1 (Large Model) integration
 [l1_provider]
 # Enable/disable LLM integration

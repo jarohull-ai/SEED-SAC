@@ -193,6 +193,7 @@ fn run_sentinel(
     let mut alert_targets: BTreeMap<u32, ProcessIdentity> = BTreeMap::new();
     let mut banner: Option<CommandBanner> = None;
     let mut l1_worker = L1Worker::spawn(&config);
+    let l0_classifier = l0::IntentClassifier::new(l0_classifier_config(&config));
     let mut command_generation = 0_u64;
     let mut pending_confirmation: Option<PendingConfirmation> = None;
     let mut next_sample_at = Instant::now();
@@ -327,6 +328,7 @@ fn run_sentinel(
             banner = None;
             if let Some(response) = handle_command(
                 &text,
+                &l0_classifier,
                 &mut l1_worker,
                 &config,
                 command_generation,
@@ -424,6 +426,7 @@ fn run_sentinel(
 /// the HUD.
 fn handle_command(
     text: &str,
+    classifier: &l0::IntentClassifier,
     l1_worker: &mut L1Worker,
     config: &Config,
     generation: u64,
@@ -448,25 +451,17 @@ fn handle_command(
     }
 
     // Triage: L0 intent classification for regular commands
-    let classifier = l0::IntentClassifier::new(l0::ClassifierConfig::default());
     let intent = classifier.classify(text);
 
     match &intent {
         l0::Intent::Unknown { .. } => {
             pending_confirmation.take();
             // Fallback: check if router recognizes it as a command
-            let action = router::parse(text);
-            match action {
-                router::Action::QueryL1(_) => {
-                    // Router can't parse - L0 also said Unknown
-                    return Some(
-                        "Nie zrozumiałem polecenia.\nSpróbuj: 'kill <process>', 'why is CPU high?'"
-                            .to_owned(),
-                    );
+            if let router::Action::QueryL1(query) = router::parse(text) {
+                if !l1_worker.submit(query, generation) {
+                    return Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned());
                 }
-                _ => {
-                    // Router recognized a command - proceed to execution
-                }
+                return Some("L1: oczekiwanie na lokalny model…".to_owned());
             }
         }
         l0::Intent::Analysis { .. } => {
@@ -534,6 +529,16 @@ fn handle_command(
     // destructive action can never execute after the user changes context.
     pending_confirmation.take();
     execute_command_action(action, l1_worker, config, generation)
+}
+
+fn l0_classifier_config(config: &Config) -> l0::ClassifierConfig {
+    let model_path = config.l0.model_path.trim();
+    l0::ClassifierConfig {
+        use_model: config.l0.use_model,
+        model_path: (!model_path.is_empty()).then(|| model_path.to_owned()),
+        confidence_threshold: config.l0.confidence_threshold,
+        verbose: false,
+    }
 }
 
 fn is_destructive(action: &router::Action) -> bool {
@@ -1011,6 +1016,26 @@ mod tests {
         }
     }
 
+    fn test_handle_command(
+        text: &str,
+        l1_worker: &mut L1Worker,
+        config: &Config,
+        generation: u64,
+        snapshot: Option<&SystemSnapshot>,
+        pending_confirmation: &mut Option<PendingConfirmation>,
+    ) -> Option<String> {
+        let classifier = l0::IntentClassifier::new(l0_classifier_config(config));
+        handle_command(
+            text,
+            &classifier,
+            l1_worker,
+            config,
+            generation,
+            snapshot,
+            pending_confirmation,
+        )
+    }
+
     #[test]
     fn poll_interval_is_clamped_to_safe_bounds() {
         assert_eq!(normalize_poll_interval_ms(0), MIN_POLL_INTERVAL_MS);
@@ -1037,7 +1062,8 @@ mod tests {
         config.l1_provider.enabled = false;
         let mut worker = L1Worker::spawn(&config);
 
-        let response = handle_command("ask local model", &mut worker, &config, 1, None, &mut None);
+        let response =
+            test_handle_command("ask local model", &mut worker, &config, 1, None, &mut None);
 
         assert_eq!(
             response.as_deref(),
@@ -1052,7 +1078,7 @@ mod tests {
         let mut worker = L1Worker::spawn(&config);
         let mut pending = None;
 
-        let response = handle_command(
+        let response = test_handle_command(
             "kill seed-sac-missing-process-xyz",
             &mut worker,
             &config,
@@ -1076,7 +1102,7 @@ mod tests {
         let mut worker = L1Worker::spawn(&config);
         let mut pending = None;
 
-        let response = handle_command(
+        let response = test_handle_command(
             "kill CARGO",
             &mut worker,
             &config,
@@ -1099,7 +1125,7 @@ mod tests {
         let mut worker = L1Worker::spawn(&config);
         let mut pending = None;
 
-        let response = handle_command(
+        let response = test_handle_command(
             "kill CARGO",
             &mut worker,
             &config,
@@ -1126,7 +1152,8 @@ mod tests {
             expires_at: Instant::now() + CONFIRMATION_TTL,
         });
 
-        let response = handle_command(CONFIRM_COMMAND, &mut worker, &config, 1, None, &mut pending);
+        let response =
+            test_handle_command(CONFIRM_COMMAND, &mut worker, &config, 1, None, &mut pending);
 
         assert_eq!(
             response.as_deref(),
@@ -1148,7 +1175,8 @@ mod tests {
             expires_at: Instant::now() - Duration::from_secs(1),
         });
 
-        let response = handle_command(CONFIRM_COMMAND, &mut worker, &config, 1, None, &mut pending);
+        let response =
+            test_handle_command(CONFIRM_COMMAND, &mut worker, &config, 1, None, &mut pending);
 
         assert_eq!(
             response.as_deref(),
@@ -1170,7 +1198,7 @@ mod tests {
             expires_at: Instant::now() + CONFIRMATION_TTL,
         });
 
-        let _ = handle_command("status", &mut worker, &config, 1, None, &mut pending);
+        let _ = test_handle_command("status", &mut worker, &config, 1, None, &mut pending);
         assert!(pending.is_none());
 
         pending = Some(PendingConfirmation {
@@ -1180,9 +1208,118 @@ mod tests {
             },
             expires_at: Instant::now() + CONFIRMATION_TTL,
         });
-        let response = handle_command(CANCEL_COMMAND, &mut worker, &config, 2, None, &mut pending);
+        let response =
+            test_handle_command(CANCEL_COMMAND, &mut worker, &config, 2, None, &mut pending);
         assert_eq!(response.as_deref(), Some("Anulowano oczekującą akcję"));
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn l0_and_router_share_system_command_aliases() {
+        let classifier = l0::IntentClassifier::new(l0::ClassifierConfig::default());
+        let cases = [
+            ("ubij chrome", router::Action::Kill("chrome".to_owned())),
+            ("pause java", router::Action::Freeze("java".to_owned())),
+            ("drop caches", router::Action::CleanCache),
+        ];
+
+        for (input, expected) in cases {
+            assert!(matches!(
+                classifier.classify(input),
+                l0::Intent::Command { .. }
+            ));
+            assert_eq!(router::parse(input), expected);
+        }
+    }
+
+    #[test]
+    fn l0_aliases_enter_system_execution_path() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        config.guard.immune_process_names.push("java".to_owned());
+        let mut worker = L1Worker::spawn(&config);
+        let mut chrome_snapshot = snapshot();
+        chrome_snapshot.processes[0].name = "chrome".to_owned();
+
+        let mut pending = None;
+        let kill_response = test_handle_command(
+            "ubij chrome",
+            &mut worker,
+            &config,
+            1,
+            Some(&chrome_snapshot),
+            &mut pending,
+        )
+        .expect("kill alias response");
+        assert!(kill_response.starts_with("POTWIERDZENIE:"));
+        assert!(matches!(
+            pending.as_ref().map(|value| &value.action),
+            Some(PendingAction::Router {
+                action: router::Action::Kill(name),
+                ..
+            }) if name == "chrome"
+        ));
+
+        pending = None;
+        let freeze_response =
+            test_handle_command("pause java", &mut worker, &config, 2, None, &mut pending);
+        assert_eq!(
+            freeze_response.as_deref(),
+            Some("Błąd: java jest na liście procesów chronionych — akcja zablokowana")
+        );
+        assert!(pending.is_none());
+
+        let cache_response =
+            test_handle_command("drop caches", &mut worker, &config, 3, None, &mut pending)
+                .expect("cache alias response");
+        assert!(cache_response.starts_with("POTWIERDZENIE:"));
+        assert!(matches!(
+            pending.as_ref().map(|value| &value.action),
+            Some(PendingAction::Router {
+                action: router::Action::CleanCache,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_intent_is_queued_for_l1() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+
+        let response = test_handle_command("abc123xyz", &mut worker, &config, 9, None, &mut None);
+        assert_eq!(
+            response.as_deref(),
+            Some("L1: oczekiwanie na lokalny model…")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Some((generation, response, _)) = worker.try_response() {
+                assert_eq!(generation, 9);
+                assert_eq!(response, L1_OFFLINE_MESSAGE);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "L1 worker did not receive prompt"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn sentinel_l0_config_maps_to_classifier_config() {
+        let mut config = Config::default();
+        config.l0.use_model = true;
+        config.l0.model_path = " /tmp/intent.onnx ".to_owned();
+        config.l0.confidence_threshold = 0.72;
+
+        let mapped = l0_classifier_config(&config);
+        assert!(mapped.use_model);
+        assert_eq!(mapped.model_path.as_deref(), Some("/tmp/intent.onnx"));
+        assert_eq!(mapped.confidence_threshold, 0.72);
     }
 
     #[test]

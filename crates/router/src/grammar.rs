@@ -11,19 +11,21 @@ use unicode_normalization::UnicodeNormalization;
 use crate::Action;
 
 /// Keywords that terminate a process, checked in order.
-const KILL_KEYWORDS: &[&str] = &["zabij", "zamknij", "kill", "terminate"];
+const KILL_KEYWORDS: &[&str] = &["zabij", "ubij", "zamknij", "kill", "terminate"];
 /// Keywords that suspend a process, checked in order.
-const FREEZE_KEYWORDS: &[&str] = &["zamroz", "freeze", "stop", "wstrzymaj"];
+const FREEZE_KEYWORDS: &[&str] = &["zamroz", "freeze", "pause", "stop", "wstrzymaj"];
 /// Keywords that resume a process, checked in order.
-const RESUME_KEYWORDS: &[&str] = &["wznow", "resume", "odblokuj", "odmroz"];
+const RESUME_KEYWORDS: &[&str] = &["wznow", "resume", "unpause", "odblokuj", "odmroz"];
 /// Explicit verb+object phrases that request page-cache cleanup.
 const CLEAN_CACHE_PHRASES: &[&str] = &[
     "wyczysc cache",
     "wyczysc pamiec podreczna",
     "oproznij cache",
     "drop cache",
+    "drop caches",
     "clean cache",
     "clear cache",
+    "czyszcz cache",
 ];
 
 /// Parse raw input into an [`Action`].
@@ -140,6 +142,7 @@ mod tests {
     #[test]
     fn alternative_polish_keywords() {
         assert_eq!(parse("zabij node"), Action::Kill("node".to_owned()));
+        assert_eq!(parse("ubij node"), Action::Kill("node".to_owned()));
         assert_eq!(parse("wstrzymaj node"), Action::Freeze("node".to_owned()));
         assert_eq!(parse("odblokuj node"), Action::Resume("node".to_owned()));
         assert_eq!(parse("odmroź node"), Action::Resume("node".to_owned()));
@@ -153,12 +156,17 @@ mod tests {
     #[test]
     fn freezes_english_process() {
         assert_eq!(parse("freeze rustc"), Action::Freeze("rustc".to_owned()));
+        assert_eq!(parse("pause java"), Action::Freeze("java".to_owned()));
     }
 
     #[test]
     fn resumes_english_process() {
         assert_eq!(
             parse("resume python3"),
+            Action::Resume("python3".to_owned())
+        );
+        assert_eq!(
+            parse("unpause python3"),
             Action::Resume("python3".to_owned())
         );
     }
@@ -265,5 +273,7 @@ mod tests {
     fn cache_rule_accepts_new_phrases() {
         assert_eq!(parse("opróżnij cache"), Action::CleanCache);
         assert_eq!(parse("clear cache"), Action::CleanCache);
+        assert_eq!(parse("drop caches"), Action::CleanCache);
+        assert_eq!(parse("czyszcz cache"), Action::CleanCache);
     }
 }

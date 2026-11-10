@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+tools/__pycache__/
 *.rlib
 *.rmeta
 Cargo.lock

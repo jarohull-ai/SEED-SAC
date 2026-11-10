@@ -135,8 +135,11 @@ impl DLPFilter {
             "AKIA",
             "password=",
             "passwd=",
+            "passwd ",
             "password ",
             "pwd=",
+            "pwd ",
+            "PASSWORD=",
             "/root/",
             "/etc/shadow",
         ];
@@ -314,24 +317,42 @@ fn scan_aws_keys(text: &str, violations: &mut Vec<DLPViolation>) {
 }
 
 fn scan_passwords(text: &str, violations: &mut Vec<DLPViolation>) {
-    const PREFIXES: &[&str] = &["--password=", "--pwd=", "--passwd="];
+    const PREFIXES: &[(&str, bool)] = &[
+        ("--password=", false),
+        ("--passwd=", false),
+        ("--pwd=", false),
+        ("--password ", false),
+        ("--passwd ", false),
+        ("--pwd ", false),
+        ("password=", true),
+        ("passwd=", true),
+        ("pwd=", true),
+        ("PASSWORD=", true),
+    ];
 
-    for &prefix in PREFIXES {
+    for &(prefix, requires_boundary) in PREFIXES {
         let mut search_from = 0;
         while let Some(rel_start) = text[search_from..].find(prefix) {
             let start = search_from + rel_start;
-            let val_start = start + prefix.len();
-            let val_slice = &text[val_start..];
-
-            let mut end = val_start;
-            for (byte_offset, ch) in val_slice.char_indices() {
-                if ch.is_whitespace() || ch == '"' || ch == '\'' {
-                    break;
-                }
-                end = val_start + byte_offset + ch.len_utf8();
+            if requires_boundary && !password_prefix_has_boundary(text, start) {
+                search_from = start + prefix.len();
+                continue;
             }
 
-            if end > val_start {
+            let raw_value_start = start + prefix.len();
+            let value_start = raw_value_start
+                + text[raw_value_start..]
+                    .chars()
+                    .take_while(|ch| *ch == ' ' || *ch == '\t')
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+            let end = password_value_end(text, value_start);
+
+            if end > value_start
+                && !violations
+                    .iter()
+                    .any(|violation| start < violation.end_pos && end > violation.start_pos)
+            {
                 violations.push(DLPViolation {
                     rule: SanitizationRule::CommandPassword,
                     pattern: format!("{prefix}*"),
@@ -341,10 +362,48 @@ fn scan_passwords(text: &str, violations: &mut Vec<DLPViolation>) {
                 });
                 search_from = end;
             } else {
-                search_from = val_start;
+                search_from = raw_value_start.max(start + 1);
             }
         }
     }
+}
+
+fn password_prefix_has_boundary(text: &str, start: usize) -> bool {
+    text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+}
+
+fn password_value_end(text: &str, value_start: usize) -> usize {
+    let value = &text[value_start..];
+    let Some(first) = value.chars().next() else {
+        return value_start;
+    };
+
+    if first == '"' || first == '\'' {
+        let content_start = value_start + first.len_utf8();
+        let mut end = content_start;
+        for (offset, ch) in text[content_start..].char_indices() {
+            if ch == '\n' || ch == '\r' {
+                break;
+            }
+            end = content_start + offset + ch.len_utf8();
+            if ch == first {
+                return end;
+            }
+        }
+        return end;
+    }
+
+    let mut end = value_start;
+    for (offset, ch) in value.char_indices() {
+        if ch.is_whitespace() {
+            break;
+        }
+        end = value_start + offset + ch.len_utf8();
+    }
+    end
 }
 
 fn scan_sensitive_paths(text: &str, violations: &mut Vec<DLPViolation>) {
@@ -445,6 +504,38 @@ mod tests {
         assert_eq!(sanitized, "mysql -u root [REDACTED:PASSWORD] db");
         assert_eq!(violations.len(), 1);
         assert_eq!(violations[0].rule, SanitizationRule::CommandPassword);
+    }
+
+    #[test]
+    fn test_redacts_environment_password() {
+        let input = "export password=hunter2";
+        let (sanitized, violations) = DLPFilter::new().sanitize(input);
+        assert_eq!(sanitized, "export [REDACTED:PASSWORD]");
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn test_redacts_quoted_password() {
+        let input = "run --password=\"SuperSecretPassword\" next";
+        let (sanitized, violations) = DLPFilter::new().sanitize(input);
+        assert_eq!(sanitized, "run [REDACTED:PASSWORD] next");
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn test_redacts_space_separated_password() {
+        let input = "run --password SuperSecretPassword next";
+        let (sanitized, violations) = DLPFilter::new().sanitize(input);
+        assert_eq!(sanitized, "run [REDACTED:PASSWORD] next");
+        assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn test_redacts_uppercase_environment_password() {
+        let input = "export PASSWORD=SuperSecretPassword";
+        let (sanitized, violations) = DLPFilter::new().sanitize(input);
+        assert_eq!(sanitized, "export [REDACTED:PASSWORD]");
+        assert_eq!(violations.len(), 1);
     }
 
     #[test]

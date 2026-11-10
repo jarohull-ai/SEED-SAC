@@ -186,14 +186,26 @@ struct OnnxRuntime {
 #[cfg(feature = "onnx")]
 impl OnnxBackend {
     pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        Self::with_confidence_threshold(model_path, 0.65)
+    }
+
+    pub fn with_confidence_threshold(
+        model_path: impl Into<PathBuf>,
+        confidence_threshold: f32,
+    ) -> Self {
         let model_path = model_path.into();
         let tokenizer_path = model_path.with_file_name("tokenizer.json");
         let runtime = Self::load_runtime(&model_path, &tokenizer_path);
+        let confidence_threshold = if confidence_threshold.is_finite() {
+            confidence_threshold.clamp(0.0, 1.0)
+        } else {
+            0.65
+        };
         Self {
             runtime,
             model_path,
             tokenizer_path,
-            confidence_threshold: 0.65,
+            confidence_threshold,
         }
     }
 

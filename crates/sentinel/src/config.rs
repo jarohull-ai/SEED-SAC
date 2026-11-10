@@ -33,7 +33,27 @@ pub struct Config {
     pub sentinel: SentinelConfig,
     pub thresholds: ThresholdsConfig,
     pub guard: GuardConfig,
+    pub l0: L0Config,
     pub l1_provider: L1ProviderConfig,
+}
+
+/// Configuration for local intent classification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct L0Config {
+    pub use_model: bool,
+    pub model_path: String,
+    pub confidence_threshold: f32,
+}
+
+impl Default for L0Config {
+    fn default() -> Self {
+        Self {
+            use_model: false,
+            model_path: String::new(),
+            confidence_threshold: 0.65,
+        }
+    }
 }
 
 /// Configuration for the local-first L1 model provider.
@@ -163,6 +183,8 @@ impl Config {
             || !ordered_percentages(vram.yellow_pct, vram.red_pct)
             || !self.guard.ram_spike_mb_per_sec.is_finite()
             || self.guard.ram_spike_mb_per_sec < 0.0
+            || !self.l0.confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.l0.confidence_threshold)
         {
             return None;
         }
@@ -330,6 +352,9 @@ mod tests {
             .contains(&"systemd".to_owned()));
         assert_eq!(config.l1_provider.model, "Ling-3.0-tiny");
         assert!(config.l1_provider.enabled);
+        assert!(!config.l0.use_model);
+        assert!(config.l0.model_path.is_empty());
+        assert_eq!(config.l0.confidence_threshold, 0.65);
     }
 
     #[test]
@@ -342,6 +367,23 @@ mod tests {
         assert_eq!(config.l1_provider.timeout_ms, 5_000);
         assert_eq!(config.l1_provider.max_tokens, 512);
         assert_eq!(config.l1_provider.temperature, 0.2);
+    }
+
+    #[test]
+    fn l0_model_configuration_can_be_overridden() {
+        let config: Config = toml::from_str(
+            r#"
+                [l0]
+                use_model = true
+                model_path = "/tmp/intent.onnx"
+                confidence_threshold = 0.72
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.l0.use_model);
+        assert_eq!(config.l0.model_path, "/tmp/intent.onnx");
+        assert_eq!(config.l0.confidence_threshold, 0.72);
     }
 
     #[test]
@@ -386,6 +428,7 @@ mod tests {
             "[sentinel]\npoll_interva_ms = 1000\n",
             "[thresholds.ram]\nyellow_pct = 70.0\nred_pcc = 85.0\n",
             "[l1_provider]\nmodle = \"custom-model\"\n",
+            "[l0]\nuse_modle = true\n",
             "[guard.immune_processes]\nnamse = [\"sac\"]\n",
         ] {
             assert!(
@@ -406,6 +449,7 @@ mod tests {
         config.thresholds.vram.yellow_pct = 0.0;
         config.thresholds.vram.red_pct = 100.0;
         config.guard.ram_spike_mb_per_sec = 0.0;
+        config.l0.confidence_threshold = 1.0;
         assert!(config.validated().is_some());
     }
 
@@ -430,6 +474,10 @@ mod tests {
         assert!(config.clone().validated().is_none());
 
         config.guard.ram_spike_mb_per_sec = f32::INFINITY;
+        assert!(config.clone().validated().is_none());
+
+        config = Config::default();
+        config.l0.confidence_threshold = 1.01;
         assert!(config.validated().is_none());
     }
 }

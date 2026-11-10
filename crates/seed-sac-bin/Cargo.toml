@@ -25,3 +25,4 @@ tempfile = "3"
 [features]
 default = []
 nvidia = ["sentinel/nvidia"]
+onnx = ["l0/onnx"]
