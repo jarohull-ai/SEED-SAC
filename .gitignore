@@ -1,6 +1,40 @@
-/target
+# Build artifacts
+/target/
+*.rlib
+*.rmeta
+Cargo.lock
+
+# IDE / Editor
+.idea/
+.vscode/
 *.swp
 *.swo
 *~
-.idea/
-.vscode/
+*.code-workspace
+.DS_Store
+.sublime-*
+
+# Environment & Configuration
+.env
+.env.local
+.env.*.local
+config/default.toml
+config/user.toml
+
+# Runtime & Logs
+*.log
+*.sqlite
+*.sqlite3
+*.db
+events.db
+/logs/
+
+# OS
+.Trash-*
+Thumbs.db
+.AppleDouble
+
+# Test coverage
+tarpaulin-report.html
+cobertura.xml
+coverage/
