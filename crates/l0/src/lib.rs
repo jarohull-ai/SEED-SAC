@@ -9,6 +9,8 @@
 
 pub mod backend;
 
+#[cfg(feature = "onnx")]
+use backend::OnnxBackend;
 use backend::{ClassificationBackend, HeuristicBackend};
 use std::fmt;
 
@@ -98,7 +100,19 @@ pub struct IntentClassifier {
 impl IntentClassifier {
     /// Create a new intent classifier with the given configuration.
     pub fn new(config: ClassifierConfig) -> Self {
-        // For now, always use heuristic backend (ONNX support via feature flag in future)
+        #[cfg(feature = "onnx")]
+        let backend: Box<dyn ClassificationBackend> = if config.use_model {
+            let model_path = config
+                .model_path
+                .clone()
+                .map(Into::into)
+                .unwrap_or_else(OnnxBackend::default_model_path);
+            Box::new(OnnxBackend::new(model_path))
+        } else {
+            Box::new(HeuristicBackend)
+        };
+
+        #[cfg(not(feature = "onnx"))]
         let backend: Box<dyn ClassificationBackend> = Box::new(HeuristicBackend);
         Self { config, backend }
     }

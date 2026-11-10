@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ort = { version = "=2.0.0-rc.15", optional = true, default-features = false, features = ["std", "load-dynamic", "api-22"] }
 
 [features]
 default = ["heuristic"]
 heuristic = []
-onnx = []
+onnx = ["dep:ort"]

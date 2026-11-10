@@ -3,6 +3,10 @@
 //! Supports both heuristic (regex) and model-based (ONNX/Candle) implementations.
 
 use crate::Intent;
+#[cfg(feature = "onnx")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "onnx")]
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Backend trait for intent classification.
@@ -165,23 +169,162 @@ impl HeuristicBackend {
     }
 }
 
-// ONNX/Candle backend stub (feature-gated)
 #[cfg(feature = "onnx")]
 pub struct OnnxBackend {
-    // Model session will go here
-    _model_path: String,
+    session: Option<Mutex<ort::session::Session>>,
+    model_path: PathBuf,
+    confidence_threshold: f32,
+}
+
+#[cfg(feature = "onnx")]
+impl OnnxBackend {
+    pub fn new(model_path: impl Into<PathBuf>) -> Self {
+        let model_path = model_path.into();
+        let session = Self::load_session(&model_path).map(Mutex::new);
+        Self {
+            session,
+            model_path,
+            confidence_threshold: 0.65,
+        }
+    }
+
+    pub fn default_model_path() -> PathBuf {
+        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(data_home).join("seed-sac/models/intent.onnx");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(".local/share/seed-sac/models/intent.onnx");
+        }
+        PathBuf::from("seed-sac/models/intent.onnx")
+    }
+
+    pub fn is_model_loaded(&self) -> bool {
+        self.session.is_some()
+    }
+
+    pub fn model_path(&self) -> &Path {
+        &self.model_path
+    }
+
+    fn load_session(model_path: &Path) -> Option<ort::session::Session> {
+        if !model_path.is_file() {
+            return None;
+        }
+        let environment = ort::init().with_name("seed-sac-l0").build().ok()?;
+        ort::session::Session::builder(&environment)
+            .ok()?
+            .commit_from_file(model_path)
+            .ok()
+    }
+
+    fn infer(&self, input: &str) -> Option<Intent> {
+        use ort::value::Tensor;
+
+        let session = self.session.as_ref()?;
+        let mut session = session.lock().ok()?;
+        let values = [input.to_owned()];
+        let tensor = Tensor::from_string_array(([1_usize], values.as_slice())).ok()?;
+        let outputs = session.run(ort::inputs![tensor]).ok()?;
+        if outputs.len() == 0 {
+            return None;
+        }
+        let (_, logits) = outputs[0].try_extract_tensor::<f32>().ok()?;
+        Some(intent_from_logits(logits, self.confidence_threshold, input))
+    }
 }
 
 #[cfg(feature = "onnx")]
 impl ClassificationBackend for OnnxBackend {
     fn classify(&self, input: &str) -> (Intent, f32) {
         let start = Instant::now();
-
-        // TODO: Implement actual ONNX inference
-        // For now, fallback to heuristic
-        let (intent, _) = HeuristicBackend.classify(input);
-
+        let intent = self
+            .infer(input)
+            .unwrap_or_else(|| HeuristicBackend.classify(input).0);
         let latency_ms = start.elapsed().as_secs_f32() * 1000.0;
         (intent, latency_ms)
+    }
+}
+
+#[cfg(feature = "onnx")]
+fn intent_from_logits(logits: &[f32], threshold: f32, input: &str) -> Intent {
+    if logits.len() < 3 || logits.iter().take(3).any(|value| !value.is_finite()) {
+        return Intent::Unknown {
+            input: input.to_owned(),
+            reason: "invalid ONNX logits".to_owned(),
+        };
+    }
+
+    let max = logits[..3]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let exp = logits[..3]
+        .iter()
+        .map(|value| (*value - max).exp())
+        .collect::<Vec<_>>();
+    let sum = exp.iter().sum::<f32>();
+    let (class, confidence) = exp
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index, value / sum))
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .unwrap_or((2, 0.0));
+
+    if confidence < threshold || class == 2 {
+        return Intent::Unknown {
+            input: input.to_owned(),
+            reason: format!("ONNX confidence {confidence:.3}"),
+        };
+    }
+
+    match class {
+        0 => Intent::Command {
+            verb: "model_command".to_owned(),
+            subject: Some(input.to_owned()),
+        },
+        1 => Intent::Analysis {
+            topic: input.chars().take(80).collect(),
+            ambiguity_score: ((1.0 - confidence) * 100.0).round() as u8,
+        },
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(all(test, feature = "onnx"))]
+mod onnx_tests {
+    use super::*;
+
+    #[test]
+    fn missing_model_uses_heuristic_fallback() {
+        let backend = OnnxBackend::new("/definitely/missing/seed-sac-intent.onnx");
+        assert!(!backend.is_model_loaded());
+        assert_eq!(
+            backend.model_path(),
+            Path::new("/definitely/missing/seed-sac-intent.onnx")
+        );
+        assert!(matches!(
+            backend.classify("kill firefox").0,
+            Intent::Command { .. }
+        ));
+    }
+
+    #[test]
+    fn logits_map_to_three_intents_and_low_confidence_is_unknown() {
+        assert!(matches!(
+            intent_from_logits(&[5.0, 0.0, 0.0], 0.65, "kill firefox"),
+            Intent::Command { .. }
+        ));
+        assert!(matches!(
+            intent_from_logits(&[0.0, 5.0, 0.0], 0.65, "why high ram"),
+            Intent::Analysis { .. }
+        ));
+        assert!(matches!(
+            intent_from_logits(&[0.0, 0.0, 5.0], 0.65, "maybe"),
+            Intent::Unknown { .. }
+        ));
+        assert!(matches!(
+            intent_from_logits(&[1.0, 1.0, 1.0], 0.65, "ambiguous"),
+            Intent::Unknown { .. }
+        ));
     }
 }
