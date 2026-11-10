@@ -1,0 +1,9 @@
+[package]
+name = "hud"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.31"
+arc-swap = "1"

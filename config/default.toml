@@ -1,0 +1,19 @@
+[sentinel]
+poll_interval_ms = 250
+
+[thresholds.ram]
+yellow_pct = 75.0
+red_pct = 88.0
+
+[thresholds.cpu]
+yellow_pct = 70.0
+
+[thresholds.vram]
+yellow_pct = 80.0
+red_pct = 92.0
+
+[guard]
+ram_spike_mb_per_sec = 500.0
+
+[guard.immune_processes]
+names = ["systemd", "pipewire", "dbus-daemon", "Xorg", "Xwayland", "kwin", "mutter", "gnome-shell", "sway", "hyprland", "sac"]
