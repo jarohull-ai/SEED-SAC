@@ -4,6 +4,12 @@
 
 # SEED SAC — System-Aware Copilot
 
+<p align="center">
+  <a href="https://github.com/jarohull-ai/SEED-SAC/actions/workflows/ci.yml"><img src="https://github.com/jarohull-ai/SEED-SAC/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/platform-Linux-333333.svg?logo=linux&logoColor=white" alt="Platform: Linux">
+</p>
+
 <p align="center"><strong>Linux resource monitoring and process protection in a lightweight desktop app.</strong></p>
 
 **Status**: Alpha — Stage 2 in progress (Cargo package version `0.2.2`).
