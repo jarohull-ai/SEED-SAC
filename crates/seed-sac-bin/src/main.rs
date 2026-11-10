@@ -13,9 +13,9 @@
 //! `renice` never freezes the window.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,12 +28,12 @@ use hud::{
 use memory::{EventType, EventWriter, SystemEvent};
 use router::executor::ExecResult;
 use router::l1_client::{L1Client, L1Config, L1Error};
-use sentinel::ProcessIdentity;
 use sentinel::config::Config;
 use sentinel::guard::{self, GuardAction};
 use sentinel::process::ProcessTracker;
 use sentinel::sampler::Sampler;
-use sentinel::{SystemSnapshot, SystemState, policy};
+use sentinel::ProcessIdentity;
+use sentinel::{policy, SystemSnapshot, SystemState};
 
 /// Smallest poll interval we accept, to keep a malformed config from turning
 /// the sentinel into a busy loop.
@@ -142,10 +142,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let writer = sentinel_handle
         .join()
         .map_err(|_| "sentinel thread panicked")?;
-    if let Some(w) = writer
-        && let Err(err) = w.shutdown()
-    {
-        tracing::warn!("error shutting down event writer: {err}");
+    if let Some(w) = writer {
+        if let Err(err) = w.shutdown() {
+            tracing::warn!("error shutting down event writer: {err}");
+        }
     }
 
     eframe_result?;
@@ -575,10 +575,10 @@ fn execute_command_action(
     generation: u64,
 ) -> Option<String> {
     if matches!(action, router::Action::QueryL1(_)) {
-        if let router::Action::QueryL1(query) = action
-            && !l1_worker.submit(query, generation)
-        {
-            return Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned());
+        if let router::Action::QueryL1(query) = action {
+            if !l1_worker.submit(query, generation) {
+                return Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned());
+            }
         }
         return Some("L1: oczekiwanie na lokalny model…".to_owned());
     }
@@ -742,10 +742,12 @@ fn handle_user_action(
         return Some("Brak zweryfikowanej tożsamości alertu — akcja zablokowana".to_owned());
     };
     if matches!(action, UserAction::Terminate(_)) {
-        if let Some(pending) = pending_confirmation.as_ref()
-            && Instant::now() < pending.expires_at
-        {
-            return Some("POTWIERDZENIE: Oczekuje już decyzja dla akcji destrukcyjnej".to_owned());
+        if let Some(pending) = pending_confirmation.as_ref() {
+            if Instant::now() < pending.expires_at {
+                return Some(
+                    "POTWIERDZENIE: Oczekuje już decyzja dla akcji destrukcyjnej".to_owned(),
+                );
+            }
         }
         return Some(confirm_alert_termination(
             identity,
@@ -1237,11 +1239,9 @@ mod tests {
             &None,
         );
 
-        assert!(
-            response
-                .as_deref()
-                .is_some_and(|text| text.starts_with("POTWIERDZENIE:"))
-        );
+        assert!(response
+            .as_deref()
+            .is_some_and(|text| text.starts_with("POTWIERDZENIE:")));
         assert!(pending.is_some());
         assert!(alerts.contains_key(&42));
     }

@@ -8,10 +8,10 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::Command;
 
-use sentinel::ProcessIdentity;
 use sentinel::config::{self, Config};
 use sentinel::guard::{self, GuardAction};
 use sentinel::policy;
+use sentinel::ProcessIdentity;
 use sysinfo::{ProcessesToUpdate, System};
 
 use crate::Action;

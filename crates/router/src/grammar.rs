@@ -5,8 +5,8 @@
 //! matched against an ordered keyword table. The first match wins; anything
 //! that does not match is forwarded to the LLM as [`Action::QueryL1`].
 
-use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::Action;
 

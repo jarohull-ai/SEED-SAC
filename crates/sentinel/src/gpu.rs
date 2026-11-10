@@ -67,11 +67,10 @@ fn read_sysfs_vram_from(drm_path: &Path) -> Option<(u64, u64)> {
         let device_path = entry.path().join("device");
         let card_total = read_sysfs_value(&device_path.join("mem_info_vram_total"));
         let card_used = read_sysfs_value(&device_path.join("mem_info_vram_used"));
-        if let (Some(card_total), Some(card_used)) = (card_total, card_used)
-            && card_total > 0
-            && card_used <= card_total
-        {
-            return Some((card_used, card_total));
+        if let (Some(card_total), Some(card_used)) = (card_total, card_used) {
+            if card_total > 0 && card_used <= card_total {
+                return Some((card_used, card_total));
+            }
         }
     }
 

@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use crate::{SharedDisplayState, UserCommand, indicators, notifications};
+use crate::{indicators, notifications, SharedDisplayState, UserCommand};
 
 const MAX_COMMAND_INPUT_CHARS: usize = 4096;
 const CONFIRM_COMMAND: &str = "__sac_confirm";

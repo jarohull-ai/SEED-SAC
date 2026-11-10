@@ -324,12 +324,10 @@ mod tests {
         assert_eq!(config.thresholds.ram.yellow_pct, 75.0);
         assert_eq!(config.thresholds.ram.red_pct, 88.0);
         assert_eq!(config.guard.ram_spike_mb_per_sec, 500.0);
-        assert!(
-            config
-                .guard
-                .immune_process_names
-                .contains(&"systemd".to_owned())
-        );
+        assert!(config
+            .guard
+            .immune_process_names
+            .contains(&"systemd".to_owned()));
         assert_eq!(config.l1_provider.model, "Ling-3.0-tiny");
         assert!(config.l1_provider.enabled);
     }

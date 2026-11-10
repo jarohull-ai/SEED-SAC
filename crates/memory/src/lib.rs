@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 
 /// Event categories recorded by the system event log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub enum EventType {
     SigstopSent,
     SigcontSent,
     Terminated,
+    DLPRedactionApplied,
 }
 
 impl EventType {
@@ -29,6 +30,7 @@ impl EventType {
             Self::SigstopSent => "SIGSTOP_SENT",
             Self::SigcontSent => "SIGCONT_SENT",
             Self::Terminated => "TERMINATED",
+            Self::DLPRedactionApplied => "DLP_REDACTION_APPLIED",
         }
     }
 }
@@ -236,10 +238,10 @@ pub fn default_database_path() -> std::path::PathBuf {
 
 /// Ensure the database directory exists, creating it if necessary.
 fn ensure_database_dir(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.exists()
-    {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     Ok(())
 }
