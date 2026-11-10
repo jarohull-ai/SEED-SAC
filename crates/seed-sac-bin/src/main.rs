@@ -25,7 +25,7 @@ use hud::{
     Alert, AlertAction, DisplayState, DisplayThresholds, SacApp, SharedDisplayState, UserAction,
     UserCommand,
 };
-use memory::{EventType, EventWriter, SystemEvent};
+use memory::{EventRecorder, EventType, EventWriter, SystemEvent};
 use router::executor::ExecResult;
 use router::l1_client::{sanitize_prompt, DLPReport, L1Client, L1Config};
 use sentinel::config::Config;
@@ -192,7 +192,8 @@ fn run_sentinel(
     let mut alerts: BTreeMap<u32, Alert> = BTreeMap::new();
     let mut alert_targets: BTreeMap<u32, ProcessIdentity> = BTreeMap::new();
     let mut banner: Option<CommandBanner> = None;
-    let mut l1_worker = L1Worker::spawn(&config);
+    let mut l1_worker =
+        L1Worker::spawn_with_audit(&config, event_writer.as_ref().map(EventWriter::recorder));
     let l0_classifier = l0::IntentClassifier::new(l0_classifier_config(&config));
     let mut command_generation = 0_u64;
     let mut pending_confirmation: Option<PendingConfirmation> = None;
@@ -305,18 +306,8 @@ fn run_sentinel(
         }
 
         while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
-            if let Err(error) = record_dlp_redaction_event(event_writer.as_ref(), &dlp_report) {
-                tracing::error!(%error, "could not queue DLP redaction audit event");
-            }
             if generation == command_generation {
-                let response_with_dlp = if dlp_report.redaction_count > 0 {
-                    format!(
-                        "[DLP] Zanonimizowano wrażliwe dane przed wysłaniem do L1\n{}",
-                        response
-                    )
-                } else {
-                    response
-                };
+                let response_with_dlp = format_l1_response(response, &dlp_report);
                 banner = Some(CommandBanner::new(response_with_dlp, Instant::now()));
             }
         }
@@ -677,7 +668,12 @@ struct L1Worker {
 }
 
 impl L1Worker {
+    #[cfg(test)]
     fn spawn(config: &Config) -> Self {
+        Self::spawn_with_audit(config, None)
+    }
+
+    fn spawn_with_audit(config: &Config, audit_recorder: Option<EventRecorder>) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<(u64, String)>(4);
         let (response_tx, response_rx) =
             mpsc::channel::<(u64, String, router::l1_client::DLPReport)>();
@@ -699,18 +695,21 @@ impl L1Worker {
                     None
                 };
                 while let Ok((generation, prompt)) = request_rx.recv() {
-                    let (response, dlp_report) = match client.as_ref() {
-                        Some(client) => {
-                            let completion = client.complete(&prompt);
-                            let response = completion
-                                .response
-                                .unwrap_or_else(|_| L1_OFFLINE_MESSAGE.to_owned());
-                            (response, completion.dlp_report)
+                    let (sanitized, dlp_report) = sanitize_prompt(&prompt);
+                    let redaction_timestamp = unix_timestamp_millis();
+                    if let (Some(recorder), Some(event)) = (
+                        audit_recorder.as_ref(),
+                        dlp_redaction_event(&dlp_report, redaction_timestamp),
+                    ) {
+                        if let Err(error) = recorder.record_confirmed(event) {
+                            tracing::error!(%error, "could not queue pre-request DLP audit event");
                         }
-                        None => {
-                            let (_, report) = sanitize_prompt(&prompt);
-                            (L1_OFFLINE_MESSAGE.to_owned(), report)
-                        }
+                    }
+                    let response = match client.as_ref() {
+                        Some(client) => client
+                            .complete_sanitized(&prompt, &sanitized)
+                            .unwrap_or_else(|_| L1_OFFLINE_MESSAGE.to_owned()),
+                        None => L1_OFFLINE_MESSAGE.to_owned(),
                     };
                     if response_tx
                         .send((generation, response, dlp_report.clone()))
@@ -961,25 +960,18 @@ fn action_pid(action: GuardAction) -> u32 {
     }
 }
 
-fn record_dlp_redaction_event(
-    writer: Option<&EventWriter>,
-    report: &DLPReport,
-) -> Result<(), String> {
+fn dlp_redaction_event(report: &DLPReport, timestamp: i64) -> Option<SystemEvent> {
     if report.redaction_count == 0 {
-        return Ok(());
+        return None;
     }
 
-    let writer = writer.ok_or_else(|| "SQLite event writer is unavailable".to_owned())?;
     let details = format!(
         "count={}; types={}",
         report.redaction_count,
         report.rules_applied.join(",")
     );
-    let event = SystemEvent {
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64,
+    Some(SystemEvent {
+        timestamp,
         event_type: EventType::DLPRedactionApplied,
         target_pid: None,
         process_name: None,
@@ -987,8 +979,26 @@ fn record_dlp_redaction_event(
         cpu_usage_pct: None,
         vram_usage_mb: None,
         details: Some(details),
-    };
-    writer.record(event).map_err(|error| error.to_string())
+    })
+}
+
+fn unix_timestamp_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn format_l1_response(response: String, report: &DLPReport) -> String {
+    if report.redaction_count == 0 {
+        return response;
+    }
+    format!(
+        "[DLP] Zanonimizowano {} sekretów przed wysłaniem do L1 (typy: {})\n{}",
+        report.redaction_count,
+        report.rules_applied.join(", "),
+        response
+    )
 }
 
 #[cfg(test)]
@@ -1581,6 +1591,8 @@ mod tests {
     fn l1_http_error_still_persists_dlp_audit_event() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock L1 server");
         let address = listener.local_addr().expect("mock server address");
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
         let mock_server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept L1 request");
             let mut request = [0_u8; 4096];
@@ -1588,6 +1600,8 @@ mod tests {
             assert!(
                 String::from_utf8_lossy(&request[..size]).starts_with("POST /v1/chat/completions")
             );
+            request_seen_tx.send(()).expect("signal request received");
+            release_rx.recv().expect("release mock response");
             stream
                 .write_all(
                     b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1599,9 +1613,44 @@ mod tests {
         config.l1_provider.enabled = true;
         config.l1_provider.base_url = format!("http://{address}/v1");
         config.l1_provider.timeout_ms = 1_000;
-        let mut worker = L1Worker::spawn(&config);
+        let directory = tempfile::tempdir().expect("create temporary data directory");
+        let database_path = directory.path().join("events.db");
+        let writer = EventWriter::open(&database_path).expect("open event writer");
+        let mut worker = L1Worker::spawn_with_audit(&config, Some(writer.recorder()));
         let prompt = "run command --passwd=StrictSecret123 now";
+        let earliest_timestamp = unix_timestamp_millis();
         assert!(worker.submit(prompt.to_owned(), 1));
+        request_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mock server received request");
+
+        let connection = rusqlite::Connection::open(&database_path).expect("open audit database");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (timestamp, event_type, details): (i64, String, String) = loop {
+            let result = connection.query_row(
+                "SELECT timestamp, event_type, details FROM system_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            );
+            match result {
+                Ok(event) => break event,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    assert!(Instant::now() < deadline, "DLP audit was not persisted");
+                    thread::yield_now();
+                }
+                Err(error) => panic!("read DLP audit event: {error}"),
+            }
+        };
+        assert!(
+            worker.try_response().is_none(),
+            "L1 response was still blocked"
+        );
+        assert!(timestamp >= earliest_timestamp);
+        assert_eq!(event_type, "DLP_REDACTION_APPLIED");
+        assert_eq!(details, "count=1; types=Command Password");
+        assert!(!details.contains("StrictSecret123"));
+
+        release_tx.send(()).expect("release mock response");
 
         let deadline = Instant::now() + Duration::from_secs(2);
         let report = loop {
@@ -1614,25 +1663,19 @@ mod tests {
         };
         assert_eq!(report.redaction_count, 1);
         assert_eq!(report.rules_applied, vec!["Command Password"]);
-
-        let directory = tempfile::tempdir().expect("create temporary data directory");
-        let database_path = directory.path().join("events.db");
-        let writer = EventWriter::open(&database_path).expect("open event writer");
-        record_dlp_redaction_event(Some(&writer), &report).expect("queue DLP audit event");
         writer.shutdown().expect("flush event writer");
-
-        let connection = rusqlite::Connection::open(&database_path).expect("open audit database");
-        let (event_type, details): (String, String) = connection
-            .query_row(
-                "SELECT event_type, details FROM system_events ORDER BY id DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("read persisted DLP audit event");
-        assert_eq!(event_type, "DLP_REDACTION_APPLIED");
-        assert!(details.contains("count=1"));
-        assert!(details.contains("Command Password"));
-        assert!(!details.contains("StrictSecret123"));
         mock_server.join().expect("mock L1 server thread");
+    }
+
+    #[test]
+    fn dlp_hud_notice_contains_count_and_rule_types() {
+        let report = DLPReport {
+            redaction_count: 2,
+            rules_applied: vec!["GitHub Token".to_owned(), "Command Password".to_owned()],
+        };
+        let message = format_l1_response("answer".to_owned(), &report);
+        assert!(message.contains("2 sekretów"));
+        assert!(message.contains("GitHub Token, Command Password"));
+        assert!(message.ends_with("answer"));
     }
 }

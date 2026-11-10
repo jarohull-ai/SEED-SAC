@@ -5,7 +5,7 @@
 //! HUD nor the sentinel sampler performs SQLite I/O.
 
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
 
 use rusqlite::{params, Connection};
@@ -51,6 +51,7 @@ pub struct SystemEvent {
 
 enum Command {
     Record(SystemEvent),
+    RecordAndConfirm(SystemEvent, SyncSender<Result<(), String>>),
     Shutdown,
 }
 
@@ -60,6 +61,7 @@ pub enum MemoryError {
     WorkerStart(String),
     WorkerStopped,
     WorkerPanicked,
+    RecordFailed(String),
 }
 
 impl std::fmt::Display for MemoryError {
@@ -68,6 +70,7 @@ impl std::fmt::Display for MemoryError {
             Self::WorkerStart(message) => write!(f, "could not start memory writer: {message}"),
             Self::WorkerStopped => f.write_str("memory writer is no longer available"),
             Self::WorkerPanicked => f.write_str("memory writer thread panicked"),
+            Self::RecordFailed(message) => write!(f, "could not persist event: {message}"),
         }
     }
 }
@@ -78,6 +81,34 @@ impl std::error::Error for MemoryError {}
 pub struct EventWriter {
     sender: Option<Sender<Command>>,
     worker: Option<JoinHandle<()>>,
+}
+
+/// Cloneable, record-only handle for background producers.
+#[derive(Clone)]
+pub struct EventRecorder {
+    sender: Sender<Command>,
+}
+
+impl EventRecorder {
+    /// Queue an event without owning or shutting down the database worker.
+    pub fn record(&self, event: SystemEvent) -> Result<(), MemoryError> {
+        self.sender
+            .send(Command::Record(event))
+            .map_err(|_| MemoryError::WorkerStopped)
+    }
+
+    /// Persist an event and wait for the database worker to confirm the insert.
+    pub fn record_confirmed(&self, event: SystemEvent) -> Result<(), MemoryError> {
+        let (confirmation_tx, confirmation_rx) = mpsc::sync_channel(1);
+        self.sender
+            .send(Command::RecordAndConfirm(event, confirmation_tx))
+            .map_err(|_| MemoryError::WorkerStopped)?;
+        match confirmation_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => Err(MemoryError::RecordFailed(message)),
+            Err(_) => Err(MemoryError::WorkerStopped),
+        }
+    }
 }
 
 impl EventWriter {
@@ -135,6 +166,17 @@ impl EventWriter {
             .expect("writer sender is present until shutdown")
             .send(Command::Record(event))
             .map_err(|_| MemoryError::WorkerStopped)
+    }
+
+    /// Return a cloneable, record-only handle for another worker thread.
+    pub fn recorder(&self) -> EventRecorder {
+        EventRecorder {
+            sender: self
+                .sender
+                .as_ref()
+                .expect("writer sender is present until shutdown")
+                .clone(),
+        }
     }
 
     /// Close the channel and wait for queued events to be written.
@@ -215,6 +257,22 @@ fn run_writer(connection: Connection, receiver: mpsc::Receiver<Command>) {
                     eprintln!("SEED SAC memory writer could not record event: {error}");
                 }
             }
+            Command::RecordAndConfirm(event, confirmation_tx) => {
+                let result = statement
+                    .execute(params![
+                        event.timestamp,
+                        event.event_type.as_str(),
+                        event.target_pid,
+                        event.process_name,
+                        event.ram_usage_mb,
+                        event.cpu_usage_pct,
+                        event.vram_usage_mb,
+                        event.details,
+                    ])
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = confirmation_tx.send(result);
+            }
             Command::Shutdown => break,
         }
     }
@@ -260,6 +318,10 @@ mod tests {
         assert_eq!(EventType::SigstopSent.as_str(), "SIGSTOP_SENT");
         assert_eq!(EventType::SigcontSent.as_str(), "SIGCONT_SENT");
         assert_eq!(EventType::Terminated.as_str(), "TERMINATED");
+        assert_eq!(
+            EventType::DLPRedactionApplied.as_str(),
+            "DLP_REDACTION_APPLIED"
+        );
     }
 
     #[test]

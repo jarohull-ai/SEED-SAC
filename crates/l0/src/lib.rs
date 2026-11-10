@@ -128,7 +128,7 @@ impl IntentClassifier {
         let (intent, latency_ms) = self.backend.classify(input);
 
         if self.config.verbose {
-            eprintln!("[L0] {} (latency: {:.2}ms)", intent, latency_ms);
+            tracing::debug!(%intent, latency_ms, "L0 classified intent");
         }
 
         intent

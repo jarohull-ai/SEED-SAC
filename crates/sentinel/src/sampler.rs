@@ -5,7 +5,7 @@ use sysinfo::{ProcessesToUpdate, System};
 use crate::{ProcessInfo, SystemSnapshot};
 
 /// How many fast ticks (CPU + RAM only) between full process table refreshes.
-const PROCESS_REFRESH_EVERY: u32 = 4;
+pub(crate) const PROCESS_REFRESH_EVERY: u32 = 4;
 
 /// Stateful sampler. Reuse one instance so CPU deltas have a previous sample.
 pub struct Sampler {

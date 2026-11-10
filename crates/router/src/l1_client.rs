@@ -94,12 +94,16 @@ pub struct L1Completion {
 /// Sanitize one prompt and summarize its redactions without retaining values.
 pub fn sanitize_prompt(prompt: &str) -> (String, DLPReport) {
     let (sanitized, violations) = DLPFilter::new().sanitize(prompt);
+    let mut rules_applied = Vec::new();
+    for violation in &violations {
+        let label = violation.rule.label().to_owned();
+        if !rules_applied.contains(&label) {
+            rules_applied.push(label);
+        }
+    }
     let report = DLPReport {
         redaction_count: violations.len(),
-        rules_applied: violations
-            .iter()
-            .map(|violation| violation.rule.label().to_owned())
-            .collect(),
+        rules_applied,
     };
     (sanitized, report)
 }
@@ -145,7 +149,11 @@ impl L1Client {
         }
     }
 
-    fn complete_sanitized(&self, prompt: &str, sanitized: &str) -> Result<String, L1Error> {
+    /// Send a prompt already processed by [`sanitize_prompt`].
+    ///
+    /// This split lets the worker persist its DLP audit record before any
+    /// network operation starts.
+    pub fn complete_sanitized(&self, prompt: &str, sanitized: &str) -> Result<String, L1Error> {
         if prompt.trim().is_empty() {
             return Err(L1Error::EmptyPrompt);
         }
@@ -233,6 +241,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
 
     fn local_server(response: &'static str) -> (String, thread::JoinHandle<()>) {
@@ -254,6 +263,60 @@ mod tests {
                 .expect("write response");
         });
         (address, handle)
+    }
+
+    fn local_server_capturing_json(
+        response: &'static str,
+    ) -> (
+        String,
+        mpsc::Receiver<serde_json::Value>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local test server");
+        let address = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (body_tx, body_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            let body_start = loop {
+                let size = stream.read(&mut chunk).expect("read request");
+                assert!(size > 0, "connection closed before HTTP headers");
+                request.extend_from_slice(&chunk[..size]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = std::str::from_utf8(&request[..body_start]).expect("UTF-8 headers");
+            assert!(headers.starts_with("POST /v1/chat/completions"));
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("content-length header");
+            while request.len() - body_start < content_length {
+                let size = stream.read(&mut chunk).expect("read request body");
+                assert!(size > 0, "connection closed before HTTP body");
+                request.extend_from_slice(&chunk[..size]);
+            }
+            let body = serde_json::from_slice(&request[body_start..body_start + content_length])
+                .expect("JSON request body");
+            body_tx.send(body).expect("send captured request body");
+
+            let payload = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            );
+            stream
+                .write_all(payload.as_bytes())
+                .expect("write response");
+        });
+        (address, body_rx, handle)
     }
 
     #[test]
@@ -326,7 +389,7 @@ mod tests {
 
     #[test]
     fn sanitizes_prompt_with_dlp_filter() {
-        let (endpoint, server) = local_server(
+        let (endpoint, body_rx, server) = local_server_capturing_json(
             r#"{"choices":[{"message":{"role":"assistant","content":"sanitized response"}}]}"#,
         );
         let client = L1Client::new(L1Config {
@@ -349,6 +412,14 @@ mod tests {
         assert!(dlp_report
             .rules_applied
             .contains(&"Command Password".to_string()));
+        let body = body_rx.recv().expect("captured JSON request body");
+        let content = body["messages"][0]["content"]
+            .as_str()
+            .expect("messages[0].content string");
+        assert!(!content.contains("ghp_"));
+        assert!(!content.contains("hunter2"));
+        assert!(content.contains("[REDACTED:GITHUB_PAT]"));
+        assert!(content.contains("[REDACTED:PASSWORD]"));
         server.join().unwrap();
     }
 }

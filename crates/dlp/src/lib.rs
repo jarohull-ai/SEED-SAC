@@ -17,6 +17,8 @@ pub enum SanitizationRule {
     GitLabToken,
     /// AWS Access Key ID (AKIA*).
     AWSAccessKey,
+    /// AWS Secret Access Key assignment (40 base64 characters).
+    AWSSecretKey,
     /// Command line password arguments (--password=*, --pwd=*).
     CommandPassword,
     /// Sensitive system paths (/root/*, /etc/shadow).
@@ -31,6 +33,7 @@ impl SanitizationRule {
             Self::GitHubToken => "GitHub Token",
             Self::GitLabToken => "GitLab Token",
             Self::AWSAccessKey => "AWS Access Key",
+            Self::AWSSecretKey => "AWS Secret Access Key",
             Self::CommandPassword => "Command Password",
             Self::PathSensitive => "Sensitive System Path",
         }
@@ -43,6 +46,7 @@ impl SanitizationRule {
             Self::GitHubToken => "[REDACTED:GITHUB_PAT]",
             Self::GitLabToken => "[REDACTED:GITLAB_PAT]",
             Self::AWSAccessKey => "[REDACTED:AWS_KEY]",
+            Self::AWSSecretKey => "[REDACTED:AWS_SECRET]",
             Self::CommandPassword => "[REDACTED:PASSWORD]",
             Self::PathSensitive => "[REDACTED:SENSITIVE_PATH]",
         }
@@ -52,7 +56,9 @@ impl SanitizationRule {
     pub const fn severity(self) -> Severity {
         match self {
             Self::SSHKey => Severity::Critical,
-            Self::GitHubToken | Self::GitLabToken | Self::AWSAccessKey => Severity::High,
+            Self::GitHubToken | Self::GitLabToken | Self::AWSAccessKey | Self::AWSSecretKey => {
+                Severity::High
+            }
             Self::CommandPassword => Severity::High,
             Self::PathSensitive => Severity::Medium,
         }
@@ -108,6 +114,7 @@ impl Default for DLPFilter {
                 SanitizationRule::GitHubToken,
                 SanitizationRule::GitLabToken,
                 SanitizationRule::AWSAccessKey,
+                SanitizationRule::AWSSecretKey,
                 SanitizationRule::CommandPassword,
                 SanitizationRule::PathSensitive,
             ],
@@ -133,6 +140,8 @@ impl DLPFilter {
             "ghp_",
             "glpat-",
             "AKIA",
+            "AWS_SECRET_ACCESS_KEY",
+            "aws_secret_access_key",
             "password=",
             "passwd=",
             "passwd ",
@@ -159,6 +168,7 @@ impl DLPFilter {
                 SanitizationRule::GitHubToken => scan_github_tokens(text, &mut violations),
                 SanitizationRule::GitLabToken => scan_gitlab_tokens(text, &mut violations),
                 SanitizationRule::AWSAccessKey => scan_aws_keys(text, &mut violations),
+                SanitizationRule::AWSSecretKey => scan_aws_secret_keys(text, &mut violations),
                 SanitizationRule::CommandPassword => scan_passwords(text, &mut violations),
                 SanitizationRule::PathSensitive => scan_sensitive_paths(text, &mut violations),
             }
@@ -214,10 +224,7 @@ fn scan_ssh_keys(text: &str, violations: &mut Vec<DLPViolation>) {
             let end_marker = header.replace("BEGIN", "END");
             let end = match text[start..].find(&end_marker) {
                 Some(rel_end) => start + rel_end + end_marker.len(),
-                None => {
-                    // Truncated key header
-                    start + header.len()
-                }
+                None => text.len(),
             };
 
             violations.push(DLPViolation {
@@ -312,6 +319,63 @@ fn scan_aws_keys(text: &str, violations: &mut Vec<DLPViolation>) {
             search_from = end;
         } else {
             search_from = start + prefix.len();
+        }
+    }
+}
+
+fn scan_aws_secret_keys(text: &str, violations: &mut Vec<DLPViolation>) {
+    const PREFIXES: &[&str] = &["AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"];
+
+    for prefix in PREFIXES {
+        let mut search_from = 0;
+        while let Some(relative_start) = text[search_from..].find(prefix) {
+            let assignment_start = search_from + relative_start;
+            let after_name = assignment_start + prefix.len();
+            let Some(relative_equals) = text[after_name..]
+                .find('=')
+                .filter(|offset| text[after_name..after_name + offset].trim().is_empty())
+            else {
+                search_from = after_name;
+                continue;
+            };
+            let raw_value_start = after_name + relative_equals + 1;
+            let value_start = raw_value_start
+                + text[raw_value_start..]
+                    .chars()
+                    .take_while(|character| character.is_whitespace())
+                    .map(char::len_utf8)
+                    .sum::<usize>();
+            let value = &text[value_start..];
+            let quote = value
+                .chars()
+                .next()
+                .filter(|character| matches!(character, '"' | '\''));
+            let secret_start = value_start + quote.map_or(0, char::len_utf8);
+            let secret_len = text[secret_start..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '/' | '=')
+                })
+                .count();
+
+            if secret_len == 40 {
+                let mut end = secret_start + secret_len;
+                if let Some(quote) = quote {
+                    if text[end..].starts_with(quote) {
+                        end += quote.len_utf8();
+                    }
+                }
+                violations.push(DLPViolation {
+                    rule: SanitizationRule::AWSSecretKey,
+                    pattern: format!("{prefix}=*"),
+                    start_pos: value_start,
+                    end_pos: end,
+                    severity: Severity::High,
+                });
+                search_from = end;
+            } else {
+                search_from = raw_value_start.max(assignment_start + 1);
+            }
         }
     }
 }
@@ -497,6 +561,19 @@ mod tests {
     }
 
     #[test]
+    fn test_redacts_aws_secret_access_key_assignments() {
+        let secret = "0123456789012345678901234567890123456789";
+        assert_eq!(secret.len(), 40);
+        for name in ["AWS_SECRET_ACCESS_KEY", "aws_secret_access_key"] {
+            let input = format!("{name}={secret}");
+            let (sanitized, violations) = DLPFilter::new().sanitize(&input);
+            assert_eq!(sanitized, format!("{name}=[REDACTED:AWS_SECRET]"));
+            assert_eq!(violations.len(), 1);
+            assert_eq!(violations[0].rule, SanitizationRule::AWSSecretKey);
+        }
+    }
+
+    #[test]
     fn test_redacts_command_line_password() {
         let filter = DLPFilter::new();
         let input = "mysql -u root --password=SuperSecretPassword123 db";
@@ -573,6 +650,15 @@ mod tests {
         let (sanitized, violations) = filter.sanitize(input);
         assert_eq!(sanitized, "[REDACTED:SSH_PRIVATE_KEY]");
         assert_eq!(violations.len(), 1);
+    }
+
+    #[test]
+    fn test_truncated_private_key_redacts_to_end_of_buffer() {
+        let input = "prefix -----BEGIN OPENSSH PRIVATE KEY-----\nsecret-key-material\nno footer";
+        let (sanitized, violations) = DLPFilter::new().sanitize(input);
+        assert_eq!(sanitized, "prefix [REDACTED:SSH_PRIVATE_KEY]");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].end_pos, input.len());
     }
 
     #[test]
