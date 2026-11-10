@@ -4,11 +4,11 @@
 
 # SEED SAC — System-Aware Copilot
 
-<p align="center"><strong>Application state protected in a fraction of a second.</strong></p>
+<p align="center"><strong>Linux resource monitoring and process protection in a lightweight desktop app.</strong></p>
 
-**Status**: Stable Alpha (v0.2.2)
+**Status**: Alpha — Stage 2 in progress (Cargo package version `0.2.2`).
 
-A lightweight, real-time system resource monitor and AI-assisted workload manager for Linux workstations. Protects your system from OOM crashes with hardware-aware policy enforcement and edge-ML integration.
+SEED SAC is a Rust/Linux system monitor and workload guard. It tracks CPU, RAM, and VRAM pressure, then can freeze a selected runaway process with `SIGSTOP` and identity-bound `pidfd` signaling to help prevent out-of-memory (OOM) crashes. Optional L1 analysis connects to a local OpenAI-compatible language model.
 
 ## Features
 
@@ -33,7 +33,7 @@ A lightweight, real-time system resource monitor and AI-assisted workload manage
 ### Safety Hardening
 - **pidfd identity binding** — Fail-closed process signal delivery (not SIGKILL-vulnerable)
 - **Two-step destructive confirmation** — Kill and drop-caches require explicit user confirmation with 30-second timeout
-- **Prompt-Guard ready** — Architecture prepared for DLP filtering before LLM context upload
+- **DLP filtering** — Planned for Stage 2; not yet enforced before L1 context upload
 - **Zero UI thread blocking** — All disk I/O and system calls happen off-thread via async channels
 
 ## Quick Start
@@ -137,9 +137,9 @@ Edit `config/default.toml` to adjust:
 - Prevents permanent system hangs
 - Logged: "thawed process on exit"
 
-### DLP Ready
-- Router accepts L0 micro-model filtering before LLM context
-- No credentials, SSH keys, or system internals uploaded to L1 without filtering
+### L1 Data Protection Status
+DLP filtering is planned as the next Stage 2 phase. Until it is implemented and
+validated, do not send credentials, SSH keys, or private system data to L1.
 
 ## Contributing
 
@@ -175,13 +175,14 @@ at your option.
 
 ## Roadmap
 
-| Version | Focus |
-|---------|-------|
-| v0.2.2-alpha (current) | Operational safety (Thaw-on-Exit, Renice de-spam) |
-| v0.3-alpha | Memory layer (SQLite events log) |
-| v0.4-alpha | Needle/MiniLM micro-model integration |
-| v0.5-beta | DLP + Prompt-Guard filtering |
-| v1.0 | General availability |
+Stage 2 is in progress in this order:
+
+1. **DLP sanitizer** — filter sensitive data before L1 escalation.
+2. **L0 micro-model** — add model-based intent classification after DLP.
+3. **Integration** — connect the stages to HUD and validate the full flow.
+
+The kickoff document targets `v0.4.0-alpha` after Stage 2 integration; this is a
+target, not a published release.
 
 ---
 
