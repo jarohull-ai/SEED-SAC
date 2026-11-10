@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Linux resource monitoring and process protection in a lightweight desktop app.</strong></p>
 
-**Status**: Alpha — Stage 2 in progress (Cargo package version `0.3.1-alpha`).
+**Status**: Alpha — Stage 2 in progress (Cargo package version `0.3.2-alpha`).
 
 SEED SAC is a Rust/Linux system monitor and workload guard. It tracks CPU, RAM, and VRAM pressure, then can freeze a selected runaway process with `SIGSTOP` and identity-bound `pidfd` signaling to help prevent out-of-memory (OOM) crashes. Optional L1 analysis connects to a local OpenAI-compatible language model.
 
