@@ -303,9 +303,14 @@ fn run_sentinel(
             next_sample_at = Instant::now() + poll_interval;
         }
 
-        while let Some((generation, response, redaction_occurred)) = l1_worker.try_response() {
-            if redaction_occurred {
+        while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
+            if dlp_report.redaction_count > 0 {
                 if let Some(writer) = &event_writer {
+                    let details = format!(
+                        "count={}; types={}",
+                        dlp_report.redaction_count,
+                        dlp_report.rules_applied.join(",")
+                    );
                     let event = SystemEvent {
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -317,13 +322,13 @@ fn run_sentinel(
                         ram_usage_mb: None,
                         cpu_usage_pct: None,
                         vram_usage_mb: None,
-                        details: Some("sensitive data redacted before L1 submission".to_owned()),
+                        details: Some(details),
                     };
                     let _ = writer.record(event);
                 }
             }
             if generation == command_generation {
-                let response_with_dlp = if redaction_occurred {
+                let response_with_dlp = if dlp_report.redaction_count > 0 {
                     format!(
                         "[DLP] Zanonimizowano wrażliwe dane przed wysłaniem do L1\n{}",
                         response
@@ -645,13 +650,14 @@ fn execute_confirmed_command_action(
 /// while LM Studio is starting or timing out.
 struct L1Worker {
     request_tx: SyncSender<(u64, String)>,
-    response_rx: Receiver<(u64, String, bool)>,
+    response_rx: Receiver<(u64, String, router::l1_client::DLPReport)>,
 }
 
 impl L1Worker {
     fn spawn(config: &Config) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<(u64, String)>(4);
-        let (response_tx, response_rx) = mpsc::channel::<(u64, String, bool)>();
+        let (response_tx, response_rx) =
+            mpsc::channel::<(u64, String, router::l1_client::DLPReport)>();
         let provider = config.l1_provider.clone().validated();
         thread::Builder::new()
             .name("l1-client".to_owned())
@@ -670,16 +676,16 @@ impl L1Worker {
                     None
                 };
                 while let Ok((generation, prompt)) = request_rx.recv() {
-                    let (response, redaction_occurred) =
-                        match client.as_ref().map(|c| c.complete(&prompt)) {
-                            Some(Ok((content, dlp_report))) => {
-                                let redacted = dlp_report.redaction_count > 0;
-                                (content, redacted)
-                            }
-                            Some(Err(_)) | None => (L1_OFFLINE_MESSAGE.to_owned(), false),
-                        };
+                    let (response, dlp_report) = match client.as_ref().map(|c| c.complete(&prompt))
+                    {
+                        Some(Ok((content, report))) => (content, report),
+                        Some(Err(_)) | None => (
+                            L1_OFFLINE_MESSAGE.to_owned(),
+                            router::l1_client::DLPReport::default(),
+                        ),
+                    };
                     if response_tx
-                        .send((generation, response, redaction_occurred))
+                        .send((generation, response, dlp_report.clone()))
                         .is_err()
                     {
                         break;
@@ -702,7 +708,7 @@ impl L1Worker {
         }
     }
 
-    fn try_response(&self) -> Option<(u64, String, bool)> {
+    fn try_response(&self) -> Option<(u64, String, router::l1_client::DLPReport)> {
         self.response_rx.try_recv().ok()
     }
 }
@@ -1370,7 +1376,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         let deadline = Instant::now() + Duration::from_secs(1);
         let response = loop {
-            if let Some((_, response, _)) = worker.try_response() {
+            if let Some((_, response, _dlp)) = worker.try_response() {
                 break response;
             }
             assert!(Instant::now() < deadline, "L1 worker did not respond");
