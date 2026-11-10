@@ -4,6 +4,7 @@ members = [
     "crates/sentinel",
     "crates/hud",
     "crates/router",
+    "crates/memory",
     "crates/seed-sac-bin",
 ]
 

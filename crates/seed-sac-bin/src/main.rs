@@ -25,6 +25,7 @@ use hud::{
     Alert, AlertAction, DisplayState, DisplayThresholds, SacApp, SharedDisplayState, UserAction,
     UserCommand,
 };
+use memory::{EventType, EventWriter, SystemEvent};
 use router::executor::ExecResult;
 use router::l1_client::{L1Client, L1Config, L1Error};
 use sentinel::ProcessIdentity;
@@ -81,6 +82,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting SEED SAC"
     );
 
+    let event_writer = match EventWriter::open(memory::default_database_path().join("events.db")) {
+        Ok(writer) => {
+            tracing::info!("memory writer started");
+            Some(writer)
+        }
+        Err(err) => {
+            tracing::warn!("could not start memory writer: {err}");
+            None
+        }
+    };
+
     let shared_state = hud::new_shared_state();
     let (action_tx, action_rx) = mpsc::channel::<UserAction>();
     let (command_tx, command_rx) = mpsc::channel::<UserCommand>();
@@ -99,6 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     command_rx,
                     running,
                     poll_interval,
+                    event_writer,
                 );
             })
             .map_err(std::io::Error::other)?
@@ -166,6 +179,7 @@ fn run_sentinel(
     command_rx: Receiver<UserCommand>,
     running: Arc<AtomicBool>,
     poll_interval: Duration,
+    event_writer: Option<EventWriter>,
 ) {
     let mut sampler = Sampler::new();
     let mut tracker = ProcessTracker::new();
@@ -185,6 +199,33 @@ fn run_sentinel(
             let state = policy::evaluate(&snapshot, &config);
             let actions = guard::mitigate(state, &deltas, &config);
 
+            // Log state transitions
+            if state != latest_state {
+                let event_type = match state {
+                    SystemState::Yellow => Some(EventType::YellowEnter),
+                    SystemState::Red => Some(EventType::RedEnter),
+                    SystemState::Green => None,
+                };
+                if let (Some(writer), Some(event_type)) = (&event_writer, event_type) {
+                    let event = SystemEvent {
+                        timestamp: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                        event_type,
+                        target_pid: None,
+                        process_name: None,
+                        ram_usage_mb: Some(snapshot.ram_used_bytes as f64 / (1024.0 * 1024.0)),
+                        cpu_usage_pct: None,
+                        vram_usage_mb: snapshot
+                            .vram_used_bytes
+                            .map(|v| v as f64 / (1024.0 * 1024.0)),
+                        details: None,
+                    };
+                    let _ = writer.record(event);
+                }
+            }
+
             for action in &actions {
                 let Some(process) = snapshot
                     .processes
@@ -199,6 +240,33 @@ fn run_sentinel(
                         if let GuardAction::Freeze { pid } = *action {
                             let name = process_name(&snapshot, pid);
                             tracing::warn!(pid, process = %name, "froze process to prevent OOM");
+
+                            // Log SIGSTOP event
+                            if let Some(writer) = &event_writer {
+                                let proc_ram = snapshot
+                                    .processes
+                                    .iter()
+                                    .find(|p| p.pid == pid)
+                                    .map(|p| p.rss_bytes as f64 / (1024.0 * 1024.0));
+                                let event = SystemEvent {
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as i64,
+                                    event_type: EventType::SigstopSent,
+                                    target_pid: Some(pid),
+                                    process_name: Some(name.clone()),
+                                    ram_usage_mb: proc_ram,
+                                    cpu_usage_pct: None,
+                                    vram_usage_mb: snapshot
+                                        .vram_used_bytes
+                                        .map(|v| v as f64 / (1024.0 * 1024.0)),
+                                    details: None,
+                                };
+                                let _ = writer.record(event);
+                            }
+
                             alerts.insert(
                                 pid,
                                 Alert {
@@ -293,6 +361,7 @@ fn run_sentinel(
                     &mut alerts,
                     &mut alert_targets,
                     &mut pending_confirmation,
+                    &event_writer,
                 ) {
                     banner = Some(CommandBanner::new(response, Instant::now()));
                 }
@@ -638,6 +707,7 @@ fn handle_user_action(
     alerts: &mut BTreeMap<u32, Alert>,
     alert_targets: &mut BTreeMap<u32, ProcessIdentity>,
     pending_confirmation: &mut Option<PendingConfirmation>,
+    event_writer: &Option<EventWriter>,
 ) -> Option<String> {
     let pid = match action {
         UserAction::Resume(pid) | UserAction::Terminate(pid) => pid,
@@ -672,6 +742,29 @@ fn handle_user_action(
     }
 
     if matches!(action, UserAction::Resume(_)) {
+        // Log SIGCONT event
+        if let Some(writer) = event_writer {
+            let proc_ram = snapshot.and_then(|s| {
+                s.processes
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .map(|p| p.rss_bytes as f64 / (1024.0 * 1024.0))
+            });
+            let event = SystemEvent {
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64,
+                event_type: EventType::SigcontSent,
+                target_pid: Some(pid),
+                process_name: Some(identity.name.clone()),
+                ram_usage_mb: proc_ram,
+                cpu_usage_pct: None,
+                vram_usage_mb: None,
+                details: None,
+            };
+            let _ = writer.record(event);
+        }
         alerts.remove(&pid);
         alert_targets.remove(&pid);
     }
@@ -1117,6 +1210,7 @@ mod tests {
             &mut alerts,
             &mut targets,
             &mut pending,
+            &None,
         );
 
         assert!(
