@@ -76,35 +76,7 @@ Edit `config/default.toml` to adjust:
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    SEED SAC v0.2.2                      │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌──────────────────┐              ┌────────────────┐ │
-│  │  Sentinel Thread │              │  HUD Thread    │ │
-│  │  (Off-UI-thread) │              │  (egui loop)   │ │
-│  │                  │              │                │ │
-│  │ • /proc sampling │─────chan─────│ • DisplayState │ │
-│  │ • Policy eval    │   (lock-free) │ • User Input  │ │
-│  │ • Guard actions  │              │ • Rendering   │ │
-│  │ • L1 requests    │              └────────────────┘ │
-│  └──────────────────┘                                  │
-│             │                                           │
-│             └── event channel ── memory-writer thread  │
-│                                                         │
-├─────────────────────────────────────────────────────────┤
-│                   Crate Structure                       │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  sentinel/   — Hardware monitoring, guard actions      │
-│  hud/        — egui interface, display state          │
-│  router/     — L0 command parsing, action execution   │
-│  memory/     — SQLite event log (WAL, worker thread)  │
-│  seed-sac-bin/ — Main binary, thread coordination     │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
-```
+![SEED SAC v0.2.2 architecture and crate structure](assets/seed-sac-architecture-v0.2.2.jpeg)
 
 ## Crate Organization
 
