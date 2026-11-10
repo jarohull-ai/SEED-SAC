@@ -302,6 +302,17 @@ fn run_sentinel(
         }
     }
 
+    // Thaw any frozen processes before exiting. A frozen process that remains
+    // SIGSTOP'd indefinitely after SAC exits creates an unrecoverable system state.
+    for (pid, identity) in alert_targets.iter() {
+        let action = guard::GuardAction::Thaw { pid: *pid };
+        if let Err(err) = guard::execute_for(&action, identity, &config) {
+            tracing::warn!(pid, %err, "failed to thaw process on exit");
+        } else {
+            tracing::info!(pid, "thawed process on exit");
+        }
+    }
+
     tracing::debug!("sentinel thread stopped");
 }
 

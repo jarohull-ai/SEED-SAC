@@ -1046,7 +1046,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "hud"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "arc-swap",
  "eframe",
@@ -2159,7 +2159,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "router"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "sentinel",
  "serde",
@@ -2246,7 +2246,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "seed-sac-bin"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "arc-swap",
  "eframe",
@@ -2265,7 +2265,7 @@ checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "sentinel"
-version = "0.1.0"
+version = "0.2.2"
 dependencies = [
  "arc-swap",
  "nix",

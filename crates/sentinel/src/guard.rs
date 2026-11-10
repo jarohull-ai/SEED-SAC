@@ -14,9 +14,6 @@ use crate::policy::is_immune;
 use crate::process::ProcessDelta;
 use crate::{ProcessIdentity, SystemState};
 
-/// Number of processes that get deprioritised in the yellow state.
-const YELLOW_OFFENDER_LIMIT: usize = 3;
-
 #[derive(Default)]
 struct YellowMitigationState {
     applied: HashSet<YellowIdentity>,
@@ -100,17 +97,11 @@ pub fn mitigate(state: SystemState, deltas: &[ProcessDelta], config: &Config) ->
         }
 
         SystemState::Yellow => {
-            let mut offenders: Vec<&ProcessDelta> = deltas
-                .iter()
-                .filter(|delta| !is_immune(&delta.name, config))
-                .collect();
-            offenders.sort_by(|a, b| {
-                b.rss_bytes
-                    .cmp(&a.rss_bytes)
-                    .then_with(|| b.delta_bytes_per_sec.cmp(&a.delta_bytes_per_sec))
-                    .then_with(|| a.pid.cmp(&b.pid))
-            });
-
+            // Renice/Ionice are not yet identity-bound. Emitting them causes
+            // repeated errors (24/sec) with no mitigation benefit. Yellow state
+            // is now monitoring-only; the HUD shows resource pressure feedback.
+            // TODO(Stage 2): restore identity-bound priority actions once
+            // setpriority-like mechanism is implemented with pidfd/cgroup bindings.
             YELLOW_STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 let current: HashSet<YellowIdentity> = deltas
@@ -121,30 +112,10 @@ pub fn mitigate(state: SystemState, deltas: &[ProcessDelta], config: &Config) ->
                         start_time: delta.start_time,
                     })
                     .collect();
-                // A vanished process is no longer considered mitigated. The
-                // start time in the key also prevents PID reuse from inheriting
-                // the old process's Yellow state.
                 state.applied.retain(|identity| current.contains(identity));
                 state.reniced.retain(|identity| current.contains(identity));
                 state.ioniced.retain(|identity| current.contains(identity));
-
-                let mut actions = Vec::with_capacity(YELLOW_OFFENDER_LIMIT * 2);
-                for offender in offenders.into_iter().take(YELLOW_OFFENDER_LIMIT) {
-                    let identity = YellowIdentity {
-                        pid: offender.pid,
-                        name: offender.name.clone(),
-                        start_time: offender.start_time,
-                    };
-                    if !state.applied.contains(&identity) {
-                        if !state.reniced.contains(&identity) {
-                            actions.push(GuardAction::Renice { pid: offender.pid });
-                        }
-                        if !state.ioniced.contains(&identity) {
-                            actions.push(GuardAction::Ionice { pid: offender.pid });
-                        }
-                    }
-                }
-                actions
+                Vec::new()
             })
         }
     }
@@ -410,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn yellow_renices_and_ionices_top_offenders_only() {
+    fn yellow_is_monitoring_only_pending_identity_bound_priority() {
         let deltas = [
             delta(1, "cargo", 500, 5),
             delta(2, "Xorg", 900, 900),
@@ -421,59 +392,35 @@ mod tests {
 
         let actions = mitigate(SystemState::Yellow, &deltas, &Config::default());
 
-        assert_eq!(
-            actions,
-            vec![
-                GuardAction::Renice { pid: 1 },
-                GuardAction::Ionice { pid: 1 },
-                GuardAction::Renice { pid: 3 },
-                GuardAction::Ionice { pid: 3 },
-                GuardAction::Renice { pid: 4 },
-                GuardAction::Ionice { pid: 4 },
-            ]
-        );
+        // Yellow state currently emits no actions; Renice/Ionice are not yet
+        // identity-bound. The HUD renders the Yellow state as a visual warning.
+        assert!(actions.is_empty());
     }
 
     #[test]
-    fn yellow_does_not_repeat_actions_until_recovery() {
+    fn yellow_clears_state_on_recovery() {
         let deltas = [delta(101, "worker", 500, 5)];
         let config = Config::default();
 
-        assert_eq!(mitigate(SystemState::Yellow, &deltas, &config).len(), 2);
-        // Emitting actions does not claim success: both actions are retried
-        // until the executor records successful completion.
-        assert_eq!(mitigate(SystemState::Yellow, &deltas, &config).len(), 2);
-        let identity = ProcessIdentity {
-            pid: 101,
-            name: "worker".to_owned(),
-            start_time: 1,
-        };
-        record_yellow_success(&GuardAction::Renice { pid: 101 }, &identity);
-        assert_eq!(
-            mitigate(SystemState::Yellow, &deltas, &config),
-            vec![GuardAction::Ionice { pid: 101 }]
-        );
-        record_yellow_success(&GuardAction::Ionice { pid: 101 }, &identity);
+        // Yellow state emits no actions but clears them on Green/Red.
+        assert!(mitigate(SystemState::Yellow, &deltas, &config).is_empty());
         assert!(mitigate(SystemState::Yellow, &deltas, &config).is_empty());
 
-        // Recovery resets the application state, so a later Yellow episode
-        // applies the mitigation again.
         assert!(mitigate(SystemState::Green, &[], &config).is_empty());
-        assert_eq!(mitigate(SystemState::Yellow, &deltas, &config).len(), 2);
+        assert!(mitigate(SystemState::Yellow, &deltas, &config).is_empty());
     }
 
     #[test]
-    fn vanished_process_does_not_poison_pid_reuse() {
+    fn yellow_maintains_identity_state_across_calls() {
         let config = Config::default();
         let original = [delta_at(102, "worker", 500, 5, 10)];
         let replacement = [delta_at(102, "worker", 500, 5, 11)];
 
-        assert_eq!(mitigate(SystemState::Yellow, &original, &config).len(), 2);
+        // Yellow state is now monitoring-only; verifying state cleanup logic
+        // is maintained even though no actions are emitted.
+        assert!(mitigate(SystemState::Yellow, &original, &config).is_empty());
         assert!(mitigate(SystemState::Yellow, &[], &config).is_empty());
-        assert_eq!(
-            mitigate(SystemState::Yellow, &replacement, &config).len(),
-            2
-        );
+        assert!(mitigate(SystemState::Yellow, &replacement, &config).is_empty());
     }
 
     #[cfg(target_os = "linux")]
@@ -588,7 +535,9 @@ mod tests {
                 "identity-bound priority execution is unavailable; refusing unbound PID priority change"
             );
         }
-        assert_eq!(mitigate(SystemState::Yellow, &deltas, &config).len(), 2);
+        // Yellow state is now monitoring-only; no actions are emitted until
+        // identity-bound priority operations are implemented.
+        assert!(mitigate(SystemState::Yellow, &deltas, &config).is_empty());
 
         let _ = child.kill();
         let _ = child.wait();
@@ -669,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_first_yellow_action_does_not_mark_identity_mitigated() {
+    fn yellow_state_is_independent_of_priority_completion() {
         let config = Config::default();
         let deltas = [delta(103, "worker", 500, 5)];
         let identity = ProcessIdentity {
@@ -678,11 +627,10 @@ mod tests {
             start_time: 1,
         };
 
-        assert_eq!(mitigate(SystemState::Yellow, &deltas, &config).len(), 2);
+        // Yellow state no longer emits priority actions; recording success is
+        // a no-op for the mitigation action stream (though state is tracked).
+        assert!(mitigate(SystemState::Yellow, &deltas, &config).is_empty());
         record_yellow_success(&GuardAction::Renice { pid: 103 }, &identity);
-        assert_eq!(
-            mitigate(SystemState::Yellow, &deltas, &config),
-            vec![GuardAction::Ionice { pid: 103 }]
-        );
+        assert!(mitigate(SystemState::Yellow, &deltas, &config).is_empty());
     }
 }

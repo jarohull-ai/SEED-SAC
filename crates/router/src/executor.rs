@@ -223,8 +223,7 @@ fn clean_cache() -> ExecResult {
 fn cache_error(err: &std::io::Error) -> ExecResult {
     if err.kind() == std::io::ErrorKind::PermissionDenied {
         ExecResult::Error(
-            "Brak uprawnień do czyszczenia cache. Uruchom: sudo sac lub sudo sysctl vm.drop_caches=3"
-                .to_owned(),
+            "Wymaga uprawnień roota: wykonaj 'sudo sysctl vm.drop_caches=3' w terminalu".to_owned(),
         )
     } else {
         ExecResult::Error(format!("Nie udało się wyczyścić cache: {err}"))
