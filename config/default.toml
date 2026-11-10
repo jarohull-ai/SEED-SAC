@@ -17,3 +17,12 @@ ram_spike_mb_per_sec = 500.0
 
 [guard.immune_processes]
 names = ["systemd", "pipewire", "dbus-daemon", "Xorg", "Xwayland", "kwin", "mutter", "gnome-shell", "sway", "hyprland", "sac"]
+
+[l1_provider]
+enabled = true
+backend = "openai_compatible"
+base_url = "http://127.0.0.1:1234/v1"
+model = "Ling-3.0-tiny"
+timeout_ms = 5000
+max_tokens = 512
+temperature = 0.2

@@ -30,8 +30,27 @@ pub struct SystemSnapshot {
 pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
+    pub start_time: u64,
     pub rss_bytes: u64,
     pub cpu_pct: f32,
+}
+
+/// Kernel identity used to prevent a recycled PID from receiving a signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub name: String,
+    pub start_time: u64,
+}
+
+impl ProcessInfo {
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            name: self.name.clone(),
+            start_time: self.start_time,
+        }
+    }
 }
 
 /// Overall resource state. Red wins over Yellow.

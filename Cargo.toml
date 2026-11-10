@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/sentinel",
     "crates/hud",
+    "crates/router",
     "crates/seed-sac-bin",
 ]
 

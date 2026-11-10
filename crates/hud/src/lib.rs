@@ -12,8 +12,15 @@ use std::sync::Arc;
 
 pub use app::{SacApp, UserAction};
 
+/// A command typed by the user in the HUD input bar.
+#[derive(Debug, Clone)]
+pub struct UserCommand(pub String);
+
 #[derive(Debug, Clone)]
 pub struct DisplayState {
+    /// Whether this snapshot came from the sentinel rather than the initial
+    /// placeholder state.
+    pub telemetry_available: bool,
     pub cpu_pct: f32,
     pub ram_used_bytes: u64,
     pub ram_total_bytes: u64,
@@ -21,11 +28,40 @@ pub struct DisplayState {
     pub vram_total_bytes: Option<u64>,
     pub system_state: SystemState,
     pub pending_alerts: Vec<Alert>,
+    /// Feedback from the last executed command.
+    pub command_response: Option<String>,
+    pub thresholds: DisplayThresholds,
+}
+
+/// Policy thresholds used to colour the telemetry indicators.
+///
+/// The sentinel remains the policy authority; this is only a copy for
+/// truthful presentation in the HUD.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayThresholds {
+    pub cpu_yellow_pct: f32,
+    pub ram_yellow_pct: f32,
+    pub ram_red_pct: f32,
+    pub vram_yellow_pct: f32,
+    pub vram_red_pct: f32,
+}
+
+impl Default for DisplayThresholds {
+    fn default() -> Self {
+        Self {
+            cpu_yellow_pct: 70.0,
+            ram_yellow_pct: 75.0,
+            ram_red_pct: 88.0,
+            vram_yellow_pct: 80.0,
+            vram_red_pct: 92.0,
+        }
+    }
 }
 
 impl Default for DisplayState {
     fn default() -> Self {
         Self {
+            telemetry_available: false,
             cpu_pct: 0.0,
             ram_used_bytes: 0,
             ram_total_bytes: 0,
@@ -33,6 +69,8 @@ impl Default for DisplayState {
             vram_total_bytes: None,
             system_state: SystemState::Green,
             pending_alerts: Vec::new(),
+            command_response: None,
+            thresholds: DisplayThresholds::default(),
         }
     }
 }
@@ -76,6 +114,7 @@ mod tests {
         assert_eq!(s.cpu_pct, 0.0);
         assert!(s.pending_alerts.is_empty());
         assert!(s.vram_total_bytes.is_none());
+        assert!(s.command_response.is_none());
     }
 
     #[test]

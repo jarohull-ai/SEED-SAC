@@ -33,10 +33,10 @@ pub fn evaluate(snapshot: &SystemSnapshot, config: &Config) -> SystemState {
 /// Whether a process is protected from mitigation.
 pub fn is_immune(name: &str, config: &Config) -> bool {
     let name = name.trim();
-    config
-        .guard
-        .immune_process_names
+    crate::config::immutable_process_names()
         .iter()
+        .copied()
+        .chain(config.guard.immune_process_names.iter().map(String::as_str))
         .any(|immune| immune.eq_ignore_ascii_case(name))
 }
 
@@ -116,5 +116,15 @@ mod tests {
         assert!(is_immune("xorg", &config));
         assert!(is_immune(" systemd ", &config));
         assert!(!is_immune("cargo-test", &config));
+    }
+
+    #[test]
+    fn immutable_system_names_survive_custom_config() {
+        let mut config = Config::default();
+        config.guard.immune_process_names.clear();
+
+        assert!(is_immune("systemd", &config));
+        assert!(is_immune("Xorg", &config));
+        assert!(is_immune("sac", &config));
     }
 }

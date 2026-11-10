@@ -10,21 +10,20 @@ use crate::SystemSnapshot;
 pub struct ProcessDelta {
     pub pid: u32,
     pub name: String,
+    pub start_time: u64,
     pub rss_bytes: u64,
     pub delta_bytes_per_sec: i64,
 }
 
 /// Remembers the previous RSS of every process to compute growth rates.
 pub struct ProcessTracker {
-    previous_rss: HashMap<u32, u64>,
-    last_poll: Option<Instant>,
+    previous: HashMap<u32, (u64, u64, Instant)>,
 }
 
 impl ProcessTracker {
     pub fn new() -> Self {
         Self {
-            previous_rss: HashMap::new(),
-            last_poll: None,
+            previous: HashMap::new(),
         }
     }
 
@@ -32,17 +31,17 @@ impl ProcessTracker {
     /// set. The first call reports zero deltas because no interval is known yet.
     pub fn update(&mut self, snapshot: &SystemSnapshot) -> Vec<ProcessDelta> {
         let now = Instant::now();
-        let elapsed_secs = self
-            .last_poll
-            .map(|last| now.duration_since(last).as_secs_f64())
-            .filter(|secs| *secs > 0.0);
 
         let mut deltas = Vec::with_capacity(snapshot.processes.len());
         for process in &snapshot.processes {
-            let delta_bytes_per_sec = match (self.previous_rss.get(&process.pid), elapsed_secs) {
-                (Some(previous), Some(secs)) => {
-                    let delta = process.rss_bytes as i128 - *previous as i128;
-                    (delta as f64 / secs) as i64
+            let delta_bytes_per_sec = match self.previous.get(&process.pid) {
+                Some((start_time, previous, changed_at)) if *start_time == process.start_time => {
+                    let secs = now.duration_since(*changed_at).as_secs_f64();
+                    if process.rss_bytes == *previous || secs <= 0.0 {
+                        0
+                    } else {
+                        ((process.rss_bytes as i128 - *previous as i128) as f64 / secs) as i64
+                    }
                 }
                 _ => 0,
             };
@@ -50,17 +49,27 @@ impl ProcessTracker {
             deltas.push(ProcessDelta {
                 pid: process.pid,
                 name: process.name.clone(),
+                start_time: process.start_time,
                 rss_bytes: process.rss_bytes,
                 delta_bytes_per_sec,
             });
         }
 
-        self.previous_rss = snapshot
-            .processes
-            .iter()
-            .map(|process| (process.pid, process.rss_bytes))
-            .collect();
-        self.last_poll = Some(now);
+        self.previous
+            .retain(|pid, _| snapshot.processes.iter().any(|p| p.pid == *pid));
+        for process in &snapshot.processes {
+            let entry = self.previous.entry(process.pid).or_insert((
+                process.start_time,
+                process.rss_bytes,
+                now,
+            ));
+            if entry.0 != process.start_time {
+                *entry = (process.start_time, process.rss_bytes, now);
+            } else if entry.1 != process.rss_bytes {
+                entry.1 = process.rss_bytes;
+                entry.2 = now;
+            }
+        }
 
         deltas
     }
@@ -90,6 +99,7 @@ mod tests {
             processes: vec![ProcessInfo {
                 pid: 42,
                 name: "cargo".to_owned(),
+                start_time: 1,
                 rss_bytes: rss,
                 cpu_pct: 0.0,
             }],

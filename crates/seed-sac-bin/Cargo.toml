@@ -10,7 +10,12 @@ path = "src/main.rs"
 [dependencies]
 sentinel = { path = "../sentinel" }
 hud = { path = "../hud" }
+router = { path = "../router" }
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
 arc-swap = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = []
+nvidia = ["sentinel/nvidia"]

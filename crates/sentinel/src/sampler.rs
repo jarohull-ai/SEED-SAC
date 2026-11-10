@@ -19,7 +19,7 @@ impl Sampler {
         let mut system = System::new();
         system.refresh_cpu_usage();
         system.refresh_memory();
-        system.refresh_processes(ProcessesToUpdate::All, false);
+        system.refresh_processes(ProcessesToUpdate::All, true);
 
         let last_processes = collect_processes(&system);
 
@@ -39,17 +39,19 @@ impl Sampler {
 
         self.tick = self.tick.wrapping_add(1);
         if self.tick.is_multiple_of(PROCESS_REFRESH_EVERY) {
-            self.system
-                .refresh_processes(ProcessesToUpdate::All, false);
+            self.system.refresh_processes(ProcessesToUpdate::All, true);
             self.last_processes = collect_processes(&self.system);
         }
+
+        let (vram_used_bytes, vram_total_bytes) =
+            crate::gpu::read_vram().map_or((None, None), |(used, total)| (Some(used), Some(total)));
 
         SystemSnapshot {
             cpu_usage_pct: self.system.global_cpu_usage(),
             ram_used_bytes: self.system.used_memory(),
             ram_total_bytes: self.system.total_memory(),
-            vram_used_bytes: None,
-            vram_total_bytes: None,
+            vram_used_bytes,
+            vram_total_bytes,
             processes: self.last_processes.clone(),
         }
     }
@@ -62,6 +64,7 @@ fn collect_processes(system: &System) -> Vec<ProcessInfo> {
         .map(|(pid, process)| ProcessInfo {
             pid: pid.as_u32(),
             name: process.name().to_string_lossy().into_owned(),
+            start_time: process.start_time(),
             rss_bytes: process.memory(),
             cpu_pct: process.cpu_usage(),
         })

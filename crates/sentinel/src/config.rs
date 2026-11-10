@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-const DEFAULT_IMMUNE_PROCESSES: &[&str] = &[
+const IMMUTABLE_PROCESSES: &[&str] = &[
     "systemd",
     "pipewire",
     "dbus-daemon",
@@ -22,6 +22,10 @@ const DEFAULT_IMMUNE_PROCESSES: &[&str] = &[
     "sac",
 ];
 
+pub(crate) fn immutable_process_names() -> &'static [&'static str] {
+    IMMUTABLE_PROCESSES
+}
+
 /// Top-level configuration tree.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -29,6 +33,50 @@ pub struct Config {
     pub sentinel: SentinelConfig,
     pub thresholds: ThresholdsConfig,
     pub guard: GuardConfig,
+    pub l1_provider: L1ProviderConfig,
+}
+
+/// Configuration for the local-first L1 model provider.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct L1ProviderConfig {
+    pub enabled: bool,
+    pub backend: String,
+    pub base_url: String,
+    pub model: String,
+    pub timeout_ms: u64,
+    pub max_tokens: u32,
+    pub temperature: f32,
+}
+
+impl Default for L1ProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: "openai_compatible".to_owned(),
+            base_url: "http://127.0.0.1:1234/v1".to_owned(),
+            model: "Ling-3.0-tiny".to_owned(),
+            timeout_ms: 5_000,
+            max_tokens: 512,
+            temperature: 0.2,
+        }
+    }
+}
+
+impl L1ProviderConfig {
+    pub fn validated(mut self) -> Self {
+        self.timeout_ms = self.timeout_ms.clamp(100, 60_000);
+        self.max_tokens = self.max_tokens.clamp(1, 4096);
+        self.temperature = if self.temperature.is_finite() {
+            self.temperature.clamp(0.0, 2.0)
+        } else {
+            0.2
+        };
+        if self.backend.trim().is_empty() {
+            self.backend = "openai_compatible".to_owned();
+        }
+        self
+    }
 }
 
 /// Sampler tuning.
@@ -116,7 +164,7 @@ impl Default for GuardConfig {
     fn default() -> Self {
         Self {
             ram_spike_mb_per_sec: 500.0,
-            immune_process_names: DEFAULT_IMMUNE_PROCESSES
+            immune_process_names: IMMUTABLE_PROCESSES
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect(),
@@ -144,8 +192,11 @@ pub fn load() -> Config {
         }
     };
 
-    match toml::from_str(&contents) {
-        Ok(config) => config,
+    match toml::from_str::<Config>(&contents) {
+        Ok(mut config) => {
+            config.l1_provider = config.l1_provider.validated();
+            config
+        }
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
@@ -235,6 +286,50 @@ mod tests {
                 .immune_process_names
                 .contains(&"systemd".to_owned())
         );
+        assert_eq!(config.l1_provider.model, "Ling-3.0-tiny");
+        assert!(config.l1_provider.enabled);
+    }
+
+    #[test]
+    fn l1_provider_defaults_match_contract() {
+        let config = Config::default();
+        assert!(config.l1_provider.enabled);
+        assert_eq!(config.l1_provider.backend, "openai_compatible");
+        assert_eq!(config.l1_provider.base_url, "http://127.0.0.1:1234/v1");
+        assert_eq!(config.l1_provider.model, "Ling-3.0-tiny");
+        assert_eq!(config.l1_provider.timeout_ms, 5_000);
+        assert_eq!(config.l1_provider.max_tokens, 512);
+        assert_eq!(config.l1_provider.temperature, 0.2);
+    }
+
+    #[test]
+    fn l1_provider_can_be_overridden_without_other_sections() {
+        let config: Config = toml::from_str(
+            r#"
+                [l1_provider]
+                enabled = false
+                model = "custom-model"
+                timeout_ms = 9000
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.l1_provider.enabled);
+        assert_eq!(config.l1_provider.model, "custom-model");
+        assert_eq!(config.l1_provider.timeout_ms, 9000);
+        assert_eq!(config.l1_provider.backend, "openai_compatible");
+        assert_eq!(config.l1_provider.max_tokens, 512);
+    }
+
+    #[test]
+    fn l1_provider_bounds_are_safe() {
+        let config: Config =
+            toml::from_str("[l1_provider]\ntimeout_ms=0\nmax_tokens=999999\ntemperature=-4.0\n")
+                .unwrap();
+        let provider = config.l1_provider.validated();
+        assert_eq!(provider.timeout_ms, 100);
+        assert_eq!(provider.max_tokens, 4096);
+        assert_eq!(provider.temperature, 0.0);
     }
 
     #[test]
