@@ -27,7 +27,7 @@ use hud::{
 };
 use memory::{EventType, EventWriter, SystemEvent};
 use router::executor::ExecResult;
-use router::l1_client::{L1Client, L1Config};
+use router::l1_client::{sanitize_prompt, DLPReport, L1Client, L1Config};
 use sentinel::config::Config;
 use sentinel::guard::{self, GuardAction};
 use sentinel::process::ProcessTracker;
@@ -304,28 +304,8 @@ fn run_sentinel(
         }
 
         while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
-            if dlp_report.redaction_count > 0 {
-                if let Some(writer) = &event_writer {
-                    let details = format!(
-                        "count={}; types={}",
-                        dlp_report.redaction_count,
-                        dlp_report.rules_applied.join(",")
-                    );
-                    let event = SystemEvent {
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as i64,
-                        event_type: EventType::DLPRedactionApplied,
-                        target_pid: None,
-                        process_name: None,
-                        ram_usage_mb: None,
-                        cpu_usage_pct: None,
-                        vram_usage_mb: None,
-                        details: Some(details),
-                    };
-                    let _ = writer.record(event);
-                }
+            if let Err(error) = record_dlp_redaction_event(event_writer.as_ref(), &dlp_report) {
+                tracing::error!(%error, "could not queue DLP redaction audit event");
             }
             if generation == command_generation {
                 let response_with_dlp = if dlp_report.redaction_count > 0 {
@@ -714,13 +694,18 @@ impl L1Worker {
                     None
                 };
                 while let Ok((generation, prompt)) = request_rx.recv() {
-                    let (response, dlp_report) = match client.as_ref().map(|c| c.complete(&prompt))
-                    {
-                        Some(Ok((content, report))) => (content, report),
-                        Some(Err(_)) | None => (
-                            L1_OFFLINE_MESSAGE.to_owned(),
-                            router::l1_client::DLPReport::default(),
-                        ),
+                    let (response, dlp_report) = match client.as_ref() {
+                        Some(client) => {
+                            let completion = client.complete(&prompt);
+                            let response = completion
+                                .response
+                                .unwrap_or_else(|_| L1_OFFLINE_MESSAGE.to_owned());
+                            (response, completion.dlp_report)
+                        }
+                        None => {
+                            let (_, report) = sanitize_prompt(&prompt);
+                            (L1_OFFLINE_MESSAGE.to_owned(), report)
+                        }
                     };
                     if response_tx
                         .send((generation, response, dlp_report.clone()))
@@ -971,11 +956,43 @@ fn action_pid(action: GuardAction) -> u32 {
     }
 }
 
+fn record_dlp_redaction_event(
+    writer: Option<&EventWriter>,
+    report: &DLPReport,
+) -> Result<(), String> {
+    if report.redaction_count == 0 {
+        return Ok(());
+    }
+
+    let writer = writer.ok_or_else(|| "SQLite event writer is unavailable".to_owned())?;
+    let details = format!(
+        "count={}; types={}",
+        report.redaction_count,
+        report.rules_applied.join(",")
+    );
+    let event = SystemEvent {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64,
+        event_type: EventType::DLPRedactionApplied,
+        target_pid: None,
+        process_name: None,
+        ram_usage_mb: None,
+        cpu_usage_pct: None,
+        vram_usage_mb: None,
+        details: Some(details),
+    };
+    writer.record(event).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use hud::SystemState as HudState;
     use sentinel::{ProcessInfo, SystemSnapshot};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
 
     fn snapshot() -> SystemSnapshot {
         SystemSnapshot {
@@ -1421,5 +1438,64 @@ mod tests {
             thread::yield_now();
         };
         assert_eq!(response, L1_OFFLINE_MESSAGE);
+    }
+
+    #[test]
+    fn l1_http_error_still_persists_dlp_audit_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock L1 server");
+        let address = listener.local_addr().expect("mock server address");
+        let mock_server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept L1 request");
+            let mut request = [0_u8; 4096];
+            let size = stream.read(&mut request).expect("read L1 request");
+            assert!(
+                String::from_utf8_lossy(&request[..size]).starts_with("POST /v1/chat/completions")
+            );
+            stream
+                .write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("return mock L1 failure");
+        });
+
+        let mut config = Config::default();
+        config.l1_provider.enabled = true;
+        config.l1_provider.base_url = format!("http://{address}/v1");
+        config.l1_provider.timeout_ms = 1_000;
+        let mut worker = L1Worker::spawn(&config);
+        let prompt = "run command --passwd=StrictSecret123 now";
+        assert!(worker.submit(prompt.to_owned(), 1));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = loop {
+            if let Some((_, response, report)) = worker.try_response() {
+                assert_eq!(response, L1_OFFLINE_MESSAGE);
+                break report;
+            }
+            assert!(Instant::now() < deadline, "L1 worker did not respond");
+            thread::yield_now();
+        };
+        assert_eq!(report.redaction_count, 1);
+        assert_eq!(report.rules_applied, vec!["Command Password"]);
+
+        let directory = tempfile::tempdir().expect("create temporary data directory");
+        let database_path = directory.path().join("events.db");
+        let writer = EventWriter::open(&database_path).expect("open event writer");
+        record_dlp_redaction_event(Some(&writer), &report).expect("queue DLP audit event");
+        writer.shutdown().expect("flush event writer");
+
+        let connection = rusqlite::Connection::open(&database_path).expect("open audit database");
+        let (event_type, details): (String, String) = connection
+            .query_row(
+                "SELECT event_type, details FROM system_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read persisted DLP audit event");
+        assert_eq!(event_type, "DLP_REDACTION_APPLIED");
+        assert!(details.contains("count=1"));
+        assert!(details.contains("Command Password"));
+        assert!(!details.contains("StrictSecret123"));
+        mock_server.join().expect("mock L1 server thread");
     }
 }

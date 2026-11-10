@@ -18,6 +18,10 @@ arc-swap = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
+
 [features]
 default = []
 nvidia = ["sentinel/nvidia"]

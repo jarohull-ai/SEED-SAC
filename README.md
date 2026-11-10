@@ -12,7 +12,7 @@
 
 <p align="center"><strong>Linux resource monitoring and process protection in a lightweight desktop app.</strong></p>
 
-**Status**: Alpha — Stage 2 in progress (Cargo package version `0.2.2`).
+**Status**: Alpha — Stage 2 in progress (Cargo package version `0.3.1-alpha`).
 
 SEED SAC is a Rust/Linux system monitor and workload guard. It tracks CPU, RAM, and VRAM pressure, then can freeze a selected runaway process with `SIGSTOP` and identity-bound `pidfd` signaling to help prevent out-of-memory (OOM) crashes. Optional L1 analysis connects to a local OpenAI-compatible language model.
 
@@ -39,7 +39,7 @@ SEED SAC is a Rust/Linux system monitor and workload guard. It tracks CPU, RAM, 
 ### Safety Hardening
 - **pidfd identity binding** — Fail-closed process signal delivery (not SIGKILL-vulnerable)
 - **Two-step destructive confirmation** — Kill and drop-caches require explicit user confirmation with 30-second timeout
-- **DLP filtering** — Planned for Stage 2; not yet enforced before L1 context upload
+- **DLP filtering** — Active in workspace; known sensitive patterns are redacted before L1 requests
 - **Zero UI thread blocking** — All disk I/O and system calls happen off-thread via async channels
 
 ## Quick Start
@@ -92,6 +92,8 @@ Edit `config/default.toml` to adjust:
 | `hud` | egui interface, display state management, user action capture |
 | `router` | L0 command grammar, action parsing, executor coordination |
 | `memory` | SQLite event log using a dedicated writer thread and WAL |
+| `l0` | Heuristic intent classification and routing triage |
+| `dlp` | Sensitive-pattern redaction before L1 requests |
 | `seed-sac-bin` | Main binary: thread setup, channel routing, L1 client coordination |
 
 ## Stage 1 & 1.5: Complete ✅
@@ -104,7 +106,7 @@ Edit `config/default.toml` to adjust:
 - [x] Two-step destructive confirmation
 - [x] Thaw-on-Exit safety guarantee
 - [x] AMD native VRAM via sysfs
-- [x] 113 unit tests, 100% clippy -D warnings
+- [x] 159 workspace tests passing; formatting and Clippy checks clean
 
 ## Stage 2: In Progress 🚧
 
@@ -114,11 +116,12 @@ Edit `config/default.toml` to adjust:
 - Sentinel state transitions and freeze/resume actions are queued for persistence
 - Database location follows XDG data directories (`$XDG_DATA_HOME/seed-sac/events.db`, or `~/.local/share/seed-sac/events.db`)
 
-### Planned: Micro-Models (L0 Edge Intelligence)
-- **Needle/MiniLM** — Intent classification + semantic chunking
-- **DLP/Prompt-Guard** — Filter sensitive system data before L1 upload
-- Lightweight inference: `ort` or `candle` (<100MB model size)
-- Sub-millisecond latency for command routing
+### Active / In Workspace: Intent Triage and DLP
+- `crates/l0` — Heuristic intent backend integrated with command routing and L1 handoff
+- `crates/dlp` — Redaction rules for SSH private keys, selected API tokens, command-line passwords, and sensitive paths
+- DLP reports are queued as `DLP_REDACTION_APPLIED` events in the SQLite WAL log
+
+Model-based ONNX inference remains planned; the current L0 backend is heuristic.
 
 ### Later Integration Points
 - L0 model output → router for adaptive command interpretation
@@ -144,8 +147,8 @@ Edit `config/default.toml` to adjust:
 - Logged: "thawed process on exit"
 
 ### L1 Data Protection Status
-DLP filtering is planned as the next Stage 2 phase. Until it is implemented and
-validated, do not send credentials, SSH keys, or private system data to L1.
+DLP sanitization runs before L1 requests for the patterns listed above. The rule
+set is not comprehensive; review its coverage before sending other sensitive data.
 
 ## Contributing
 
@@ -159,7 +162,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
 ## Documentation
 
 - [GitHub Wiki](https://github.com/jarohull-ai/SEED-SAC/wiki) — project overview and guides
-- [Stage 2 architecture](STAGE2_ARCHITECTURE.md) — planned memory, inference and DLP design
+- [Stage 2 architecture](STAGE2_ARCHITECTURE.md) — memory, inference and DLP design
 - [Technical specification](seed_sac_technical_specification.md)
 - [Contributing](CONTRIBUTING.md)
 
@@ -181,14 +184,14 @@ at your option.
 
 ## Roadmap
 
-Stage 2 is in progress in this order:
+Stage 2 is in progress. Current workspace status:
 
-1. **DLP sanitizer** — filter sensitive data before L1 escalation.
-2. **L0 micro-model** — add model-based intent classification after DLP.
-3. **Integration** — connect the stages to HUD and validate the full flow.
+1. **DLP sanitizer** — active in workspace and integrated before L1 escalation.
+2. **L0 heuristic triage** — active in workspace and integrated with router/L1.
+3. **Model inference and additional hardening** — planned follow-up work.
 
-The kickoff document targets `v0.4.0-alpha` after Stage 2 integration; this is a
-target, not a published release.
+The Stage 2 kickoff targets `v0.4.0-alpha` after the remaining integration and
+hardening work; this is a target, not a published release.
 
 ---
 

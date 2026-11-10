@@ -83,6 +83,27 @@ pub struct DLPReport {
     pub rules_applied: Vec<String>,
 }
 
+/// Result of an L1 request together with the DLP report produced before I/O.
+/// The report remains available even when the request fails.
+#[derive(Debug)]
+pub struct L1Completion {
+    pub response: Result<String, L1Error>,
+    pub dlp_report: DLPReport,
+}
+
+/// Sanitize one prompt and summarize its redactions without retaining values.
+pub fn sanitize_prompt(prompt: &str) -> (String, DLPReport) {
+    let (sanitized, violations) = DLPFilter::new().sanitize(prompt);
+    let report = DLPReport {
+        redaction_count: violations.len(),
+        rules_applied: violations
+            .iter()
+            .map(|violation| violation.rule.label().to_owned())
+            .collect(),
+    };
+    (sanitized, report)
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -113,27 +134,24 @@ impl L1Client {
         Ok(Self { config, agent })
     }
 
-    /// Send one prompt to `/chat/completions` and return the first text choice.
-    /// Send prompt to L1 with DLP sanitization. Returns (response, DLP report).
-    pub fn complete(&self, prompt: &str) -> Result<(String, DLPReport), L1Error> {
+    /// Send a sanitized prompt to `/chat/completions` and retain the DLP report
+    /// whether the HTTP request succeeds or fails.
+    pub fn complete(&self, prompt: &str) -> L1Completion {
+        let (sanitized, dlp_report) = sanitize_prompt(prompt);
+        let response = self.complete_sanitized(prompt, &sanitized);
+        L1Completion {
+            response,
+            dlp_report,
+        }
+    }
+
+    fn complete_sanitized(&self, prompt: &str, sanitized: &str) -> Result<String, L1Error> {
         if prompt.trim().is_empty() {
             return Err(L1Error::EmptyPrompt);
         }
         if prompt.len() > MAX_PROMPT_BYTES {
             return Err(L1Error::InvalidResponse);
         }
-
-        // Apply DLP sanitization
-        let dlp_filter = DLPFilter::new();
-        let (sanitized, violations) = dlp_filter.sanitize(prompt);
-
-        let dlp_report = DLPReport {
-            redaction_count: violations.len(),
-            rules_applied: violations
-                .iter()
-                .map(|v| v.rule.label().to_owned())
-                .collect(),
-        };
 
         let url = format!(
             "{}/chat/completions",
@@ -170,7 +188,7 @@ impl L1Client {
             .filter(|c| !c.trim().is_empty())
             .ok_or(L1Error::InvalidResponse)?;
 
-        Ok((content, dlp_report))
+        Ok(content)
     }
 }
 
@@ -252,8 +270,8 @@ mod tests {
             api_key: Some("must-not-be-logged".into()),
         })
         .unwrap();
-        let (response, _) = client.complete("ping").unwrap();
-        assert_eq!(response, "hello locally");
+        let completion = client.complete("ping");
+        assert_eq!(completion.response.unwrap(), "hello locally");
         server.join().unwrap();
     }
 
@@ -266,7 +284,7 @@ mod tests {
             ..L1Config::default()
         })
         .unwrap();
-        let error = client.complete("ping").unwrap_err();
+        let error = client.complete("ping").response.unwrap_err();
         assert!(matches!(error, L1Error::Offline | L1Error::Timeout));
         assert!(!error.to_string().contains("secret-token"));
     }
@@ -274,7 +292,10 @@ mod tests {
     #[test]
     fn empty_prompt_is_rejected_before_network() {
         let client = L1Client::new(L1Config::default()).unwrap();
-        assert!(matches!(client.complete("  "), Err(L1Error::EmptyPrompt)));
+        assert!(matches!(
+            client.complete("  ").response,
+            Err(L1Error::EmptyPrompt)
+        ));
     }
 
     #[test]
@@ -298,7 +319,7 @@ mod tests {
     fn rejects_oversized_prompt() {
         let client = L1Client::new(L1Config::default()).unwrap();
         assert!(matches!(
-            client.complete(&"x".repeat(MAX_PROMPT_BYTES + 1)),
+            client.complete(&"x".repeat(MAX_PROMPT_BYTES + 1)).response,
             Err(L1Error::InvalidResponse)
         ));
     }
@@ -317,10 +338,10 @@ mod tests {
             api_key: None,
         })
         .unwrap();
-        let (response, dlp_report) = client
-            .complete("use ghp_1234567890123456789012345678901 --password=hunter2")
-            .unwrap();
-        assert_eq!(response, "sanitized response");
+        let completion =
+            client.complete("use ghp_1234567890123456789012345678901 --password=hunter2");
+        assert_eq!(completion.response.unwrap(), "sanitized response");
+        let dlp_report = completion.dlp_report;
         assert_eq!(dlp_report.redaction_count, 2);
         assert!(dlp_report
             .rules_applied
