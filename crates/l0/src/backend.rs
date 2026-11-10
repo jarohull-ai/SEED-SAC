@@ -171,19 +171,28 @@ impl HeuristicBackend {
 
 #[cfg(feature = "onnx")]
 pub struct OnnxBackend {
-    session: Option<Mutex<ort::session::Session>>,
+    runtime: Option<OnnxRuntime>,
     model_path: PathBuf,
+    tokenizer_path: PathBuf,
     confidence_threshold: f32,
+}
+
+#[cfg(feature = "onnx")]
+struct OnnxRuntime {
+    session: Mutex<ort::session::Session>,
+    tokenizer: tokenizers::Tokenizer,
 }
 
 #[cfg(feature = "onnx")]
 impl OnnxBackend {
     pub fn new(model_path: impl Into<PathBuf>) -> Self {
         let model_path = model_path.into();
-        let session = Self::load_session(&model_path).map(Mutex::new);
+        let tokenizer_path = model_path.with_file_name("tokenizer.json");
+        let runtime = Self::load_runtime(&model_path, &tokenizer_path);
         Self {
-            session,
+            runtime,
             model_path,
+            tokenizer_path,
             confidence_threshold: 0.65,
         }
     }
@@ -199,32 +208,82 @@ impl OnnxBackend {
     }
 
     pub fn is_model_loaded(&self) -> bool {
-        self.session.is_some()
+        self.runtime.is_some()
     }
 
     pub fn model_path(&self) -> &Path {
         &self.model_path
     }
 
-    fn load_session(model_path: &Path) -> Option<ort::session::Session> {
-        if !model_path.is_file() {
+    pub fn tokenizer_path(&self) -> &Path {
+        &self.tokenizer_path
+    }
+
+    fn load_runtime(model_path: &Path, tokenizer_path: &Path) -> Option<OnnxRuntime> {
+        use tokenizers::TruncationParams;
+
+        if !model_path.is_file() || !tokenizer_path.is_file() {
             return None;
         }
+        let mut tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path).ok()?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: 128,
+                ..Default::default()
+            }))
+            .ok()?;
         let environment = ort::init().with_name("seed-sac-l0").build().ok()?;
-        ort::session::Session::builder(&environment)
+        let session = ort::session::Session::builder(&environment)
             .ok()?
             .commit_from_file(model_path)
-            .ok()
+            .ok()?;
+        Some(OnnxRuntime {
+            session: Mutex::new(session),
+            tokenizer,
+        })
     }
 
     fn infer(&self, input: &str) -> Option<Intent> {
         use ort::value::Tensor;
 
-        let session = self.session.as_ref()?;
-        let mut session = session.lock().ok()?;
-        let values = [input.to_owned()];
-        let tensor = Tensor::from_string_array(([1_usize], values.as_slice())).ok()?;
-        let outputs = session.run(ort::inputs![tensor]).ok()?;
+        let runtime = self.runtime.as_ref()?;
+        let encoding = runtime.tokenizer.encode(input, true).ok()?;
+        let sequence_len = encoding.get_ids().len();
+        if sequence_len == 0
+            || encoding.get_attention_mask().len() != sequence_len
+            || encoding.get_type_ids().len() != sequence_len
+        {
+            return None;
+        }
+
+        let input_ids = encoding
+            .get_ids()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect::<Vec<_>>();
+        let attention_mask = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect::<Vec<_>>();
+        let token_type_ids = encoding
+            .get_type_ids()
+            .iter()
+            .map(|value| i64::from(*value))
+            .collect::<Vec<_>>();
+
+        let input_ids = Tensor::from_array(([1_usize, sequence_len], input_ids)).ok()?;
+        let attention_mask = Tensor::from_array(([1_usize, sequence_len], attention_mask)).ok()?;
+        let token_type_ids = Tensor::from_array(([1_usize, sequence_len], token_type_ids)).ok()?;
+
+        let mut session = runtime.session.lock().ok()?;
+        let outputs = session
+            .run(ort::inputs![
+                "input_ids" => input_ids,
+                "attention_mask" => attention_mask,
+                "token_type_ids" => token_type_ids,
+            ])
+            .ok()?;
         if outputs.len() == 0 {
             return None;
         }
@@ -306,6 +365,31 @@ mod onnx_tests {
             backend.classify("kill firefox").0,
             Intent::Command { .. }
         ));
+    }
+
+    #[test]
+    fn missing_tokenizer_uses_heuristic_fallback() {
+        let directory = std::env::temp_dir().join(format!(
+            "seed-sac-l0-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("temporary model directory");
+        let model_path = directory.join("intent.onnx");
+        std::fs::write(&model_path, b"not loaded without tokenizer").expect("dummy model");
+
+        let backend = OnnxBackend::new(&model_path);
+        assert!(!backend.is_model_loaded());
+        assert_eq!(backend.tokenizer_path(), directory.join("tokenizer.json"));
+        assert!(matches!(
+            backend.classify("why is memory high?").0,
+            Intent::Analysis { .. }
+        ));
+
+        std::fs::remove_dir_all(directory).expect("remove temporary model directory");
     }
 
     #[test]
