@@ -1,5 +1,11 @@
 # SEED SAC — System-Aware Copilot
 
+<p align="center">
+  <img src="assets/seed-sac-logo.jpeg" alt="SEED SAC — application state protected in a fraction of a second" width="560">
+</p>
+
+<p align="center"><strong>Application state protected in a fraction of a second.</strong></p>
+
 **Status**: Stable Alpha (v0.2.2)
 
 A lightweight, real-time system resource monitor and AI-assisted workload manager for Linux workstations. Protects your system from OOM crashes with hardware-aware policy enforcement and edge-ML integration.
@@ -84,6 +90,8 @@ Edit `config/default.toml` to adjust:
 │  │ • Guard actions  │              │ • Rendering   │ │
 │  │ • L1 requests    │              └────────────────┘ │
 │  └──────────────────┘                                  │
+│             │                                           │
+│             └── event channel ── memory-writer thread  │
 │                                                         │
 ├─────────────────────────────────────────────────────────┤
 │                   Crate Structure                       │
@@ -92,6 +100,7 @@ Edit `config/default.toml` to adjust:
 │  sentinel/   — Hardware monitoring, guard actions      │
 │  hud/        — egui interface, display state          │
 │  router/     — L0 command parsing, action execution   │
+│  memory/     — SQLite event log (WAL, worker thread)  │
 │  seed-sac-bin/ — Main binary, thread coordination     │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
@@ -104,6 +113,7 @@ Edit `config/default.toml` to adjust:
 | `sentinel` | CPU/RAM/VRAM sampling, process identity tracking, guard logic (freeze/kill/thaw), pidfd signal delivery |
 | `hud` | egui interface, display state management, user action capture |
 | `router` | L0 command grammar, action parsing, executor coordination |
+| `memory` | SQLite event log using a dedicated writer thread and WAL |
 | `seed-sac-bin` | Main binary: thread setup, channel routing, L1 client coordination |
 
 ## Stage 1 & 1.5: Complete ✅
@@ -118,21 +128,21 @@ Edit `config/default.toml` to adjust:
 - [x] AMD native VRAM via sysfs
 - [x] 113 unit tests, 100% clippy -D warnings
 
-## Stage 2: In Planning 🚀
+## Stage 2: In Progress 🚧
 
-### Memory Layer (SQLite)
-- Dedicate crate: `crates/memory`
-- Events log: Yellow/Red incidents, freezes, kills, process metrics
-- Chain-of-events for Markov-based behavior learning
-- Async writes via worker thread (zero I/O in sentinel loop)
+### Phase 1: Memory Event Log
+- SQLite event log in `crates/memory`, compiled with the bundled SQLite library
+- WAL mode and a dedicated `memory-writer` thread
+- Sentinel state transitions and freeze/resume actions are queued for persistence
+- Database location follows XDG data directories (`$XDG_DATA_HOME/seed-sac/events.db`, or `~/.local/share/seed-sac/events.db`)
 
-### Micro-Models (L0 Edge Intelligence)
+### Planned: Micro-Models (L0 Edge Intelligence)
 - **Needle/MiniLM** — Intent classification + semantic chunking
 - **DLP/Prompt-Guard** — Filter sensitive system data before L1 upload
 - Lightweight inference: `ort` or `candle` (<100MB model size)
 - Sub-millisecond latency for command routing
 
-### Integration Points
+### Later Integration Points
 - L0 model output → router for adaptive command interpretation
 - Memory events → L0 for pattern anomaly detection
 - User prompts → DLP filter → L1 (never expose raw `/proc` to model)
@@ -167,6 +177,13 @@ This project is open source (MIT OR Apache-2.0). We welcome:
 - Pull requests: please include tests and follow Rust conventions
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed guidelines.
+
+## Documentation
+
+- [GitHub Wiki](https://github.com/jarohull-ai/SEED-SAC/wiki) — project overview and guides
+- [Stage 2 architecture](STAGE2_ARCHITECTURE.md) — planned memory, inference and DLP design
+- [Technical specification](seed_sac_technical_specification.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 

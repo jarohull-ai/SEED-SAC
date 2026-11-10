@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     running,
                     poll_interval,
                     event_writer,
-                );
+                )
             })
             .map_err(std::io::Error::other)?
     };
@@ -137,13 +137,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The window is gone: tell the sentinel to stop and wait for it so the
     // process exits cleanly instead of leaving a detached sampler behind.
     running.store(false, Ordering::Release);
-    let sentinel_panicked = sentinel_handle.join().is_err();
+
+    // Wait for sentinel to complete (including thaw-on-exit) and gracefully shutdown
+    let writer = sentinel_handle.join().map_err(|_| "sentinel thread panicked")?;
+    if let Some(w) = writer
+        && let Err(err) = w.shutdown()
+    {
+        tracing::warn!("error shutting down event writer: {err}");
+    }
 
     eframe_result?;
-
-    if sentinel_panicked {
-        return Err("sentinel thread panicked".into());
-    }
 
     tracing::info!("SEED SAC stopped");
     Ok(())
@@ -171,7 +174,8 @@ fn sentinel_wait_duration(next_sample_at: Instant, now: Instant) -> Duration {
 ///
 /// It publishes a fresh display snapshot on every tick, keeps frozen-process
 /// alerts alive until the user resolves them, and serves HUD actions and
-/// commands while waiting for the next tick.
+/// commands while waiting for the next tick. Returns the event_writer for
+/// graceful shutdown in main().
 fn run_sentinel(
     config: Config,
     shared_state: SharedDisplayState,
@@ -180,7 +184,7 @@ fn run_sentinel(
     running: Arc<AtomicBool>,
     poll_interval: Duration,
     event_writer: Option<EventWriter>,
-) {
+) -> Option<EventWriter> {
     let mut sampler = Sampler::new();
     let mut tracker = ProcessTracker::new();
     let mut alerts: BTreeMap<u32, Alert> = BTreeMap::new();
@@ -379,10 +383,28 @@ fn run_sentinel(
             tracing::warn!(pid, %err, "failed to thaw process on exit");
         } else {
             tracing::info!(pid, "thawed process on exit");
+            // Log SIGCONT event for thawed process
+            if let Some(writer) = &event_writer {
+                let event = SystemEvent {
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                    event_type: EventType::SigcontSent,
+                    target_pid: Some(*pid),
+                    process_name: Some(identity.name.clone()),
+                    ram_usage_mb: None,
+                    cpu_usage_pct: None,
+                    vram_usage_mb: None,
+                    details: Some("thaw-on-exit".to_owned()),
+                };
+                let _ = writer.record(event);
+            }
         }
     }
 
     tracing::debug!("sentinel thread stopped");
+    event_writer
 }
 
 /// Route a HUD command through the router and render its result as text for

@@ -387,4 +387,42 @@ mod tests {
                 || path.to_string_lossy().contains("seed-sac")
         );
     }
+
+    #[test]
+    fn test_event_writer_graceful_shutdown() {
+        let writer = EventWriter::open(":memory:").expect("in-memory database failed");
+
+        let event = SystemEvent {
+            timestamp: 1555555555,
+            event_type: EventType::Terminated,
+            target_pid: Some(7777),
+            process_name: Some("killed-process".to_owned()),
+            ram_usage_mb: Some(512.0),
+            cpu_usage_pct: None,
+            vram_usage_mb: None,
+            details: Some("thaw-on-exit".to_owned()),
+        };
+
+        writer.record(event).expect("record failed");
+        writer.shutdown().expect("shutdown failed");
+    }
+
+    #[test]
+    fn test_terminated_event_construction() {
+        let event = SystemEvent {
+            timestamp: 2000000000,
+            event_type: EventType::Terminated,
+            target_pid: Some(3000),
+            process_name: Some("test-proc".to_owned()),
+            ram_usage_mb: Some(100.0),
+            cpu_usage_pct: Some(75.0),
+            vram_usage_mb: Some(50.0),
+            details: Some("explicit termination".to_owned()),
+        };
+
+        assert_eq!(event.event_type, EventType::Terminated);
+        assert_eq!(event.event_type.as_str(), "TERMINATED");
+        assert_eq!(event.target_pid, Some(3000));
+        assert_eq!(event.details.as_deref(), Some("explicit termination"));
+    }
 }
