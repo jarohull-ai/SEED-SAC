@@ -41,6 +41,8 @@ const MIN_POLL_INTERVAL_MS: u64 = 50;
 /// Largest poll interval accepted, so malformed configuration cannot disable
 /// sentinel monitoring by making the wait effectively unbounded.
 const MAX_POLL_INTERVAL_MS: u64 = 5_000;
+const GREEN_POLL_MIN: Duration = Duration::from_secs(1);
+const GREEN_POLL_MAX: Duration = Duration::from_secs(2);
 /// Maximum time the sentinel waits before checking for a newly submitted HUD
 /// command. This is independent of telemetry sampling, so a large sampling
 /// interval cannot hide the pending acknowledgement.
@@ -214,6 +216,15 @@ fn sentinel_wait_duration(next_sample_at: Instant, now: Instant) -> Duration {
         .min(COMMAND_CHECK_INTERVAL)
 }
 
+/// Reduce `/proc` sampling while the machine is stable, but retain the
+/// configured cadence as soon as resource pressure needs close observation.
+fn adaptive_poll_interval(configured: Duration, state: SystemState) -> Duration {
+    match state {
+        SystemState::Green => configured.clamp(GREEN_POLL_MIN, GREEN_POLL_MAX),
+        SystemState::Yellow | SystemState::Red => configured,
+    }
+}
+
 /// Main loop of the background sentinel thread.
 ///
 /// It publishes a fresh display snapshot on every tick, keeps frozen-process
@@ -371,7 +382,7 @@ fn run_sentinel(
             latest_deltas = deltas;
             latest_state = state;
             state_dirty = true;
-            next_sample_at = Instant::now() + poll_interval;
+            next_sample_at = Instant::now() + adaptive_poll_interval(poll_interval, state);
         }
 
         while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
@@ -1682,6 +1693,26 @@ mod tests {
         assert_eq!(
             sentinel_wait_duration(now + Duration::from_millis(10), now),
             Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn adaptive_polling_slowdown_only_applies_to_green() {
+        assert_eq!(
+            adaptive_poll_interval(Duration::from_millis(250), SystemState::Green),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            adaptive_poll_interval(Duration::from_secs(5), SystemState::Green),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            adaptive_poll_interval(Duration::from_millis(250), SystemState::Yellow),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            adaptive_poll_interval(Duration::from_millis(250), SystemState::Red),
+            Duration::from_millis(250)
         );
     }
 
