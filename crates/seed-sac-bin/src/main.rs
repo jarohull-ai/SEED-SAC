@@ -96,13 +96,18 @@ impl DeterministicDiagnosis {
         }
     }
 
-    fn render(&self, cause: &str) -> String {
-        format!(
+    fn render(&self, explanation: Option<&str>) -> String {
+        let mut rendered = format!(
             "Diagnoza: {}\nPrzyczyna: {}\nSugerowana komenda: {}",
             self.diagnosis,
-            cause.trim().trim_start_matches("Przyczyna:").trim(),
+            self.cause_facts,
             self.suggested_command()
-        )
+        );
+        if let Some(explanation) = explanation {
+            rendered.push_str("\nObjaśnienie L1: ");
+            rendered.push_str(explanation.trim());
+        }
+        rendered
     }
 }
 
@@ -374,7 +379,7 @@ fn run_sentinel(
                     .map(|(_, diagnosis)| diagnosis)
                     .unwrap_or_else(|| deterministic_diagnosis(None, latest_state, &[], &alerts));
                 let validated = validate_l1_explanation(response, &diagnosis);
-                let rendered = diagnosis.render(&validated.text);
+                let rendered = diagnosis.render(validated.text.as_deref());
                 let response_with_dlp = format_l1_response(rendered, &dlp_report);
                 push_console(
                     &mut console,
@@ -1409,11 +1414,8 @@ fn format_l1_response(response: String, report: &DLPReport) -> String {
 
 struct ValidatedL1Explanation {
     status: &'static str,
-    text: String,
+    text: Option<String>,
 }
-
-const L1_UNAVAILABLE_FALLBACK: &str =
-    "L1 niedostępne; pokazano wyłącznie deterministyczne fakty Sentinel.";
 
 fn validate_l1_explanation(
     response: String,
@@ -1427,14 +1429,14 @@ fn validate_l1_explanation(
     {
         return ValidatedL1Explanation {
             status: "[L1 UNVERIFIED]",
-            text: L1_UNAVAILABLE_FALLBACK.to_owned(),
+            text: None,
         };
     }
 
     let Some(cause) = trimmed.strip_prefix("Przyczyna:").map(str::trim) else {
         return ValidatedL1Explanation {
             status: "[L1 UNVERIFIED]",
-            text: L1_UNAVAILABLE_FALLBACK.to_owned(),
+            text: None,
         };
     };
     if cause.is_empty()
@@ -1444,12 +1446,12 @@ fn validate_l1_explanation(
     {
         return ValidatedL1Explanation {
             status: "[L1 UNVERIFIED]",
-            text: L1_UNAVAILABLE_FALLBACK.to_owned(),
+            text: None,
         };
     }
     ValidatedL1Explanation {
         status: "[L1 VERIFIED]",
-        text: cause.to_owned(),
+        text: Some(cause.to_owned()),
     }
 }
 
@@ -1861,10 +1863,10 @@ mod tests {
         let timeout =
             validate_l1_explanation("L1 request failed: L1 request timed out".to_owned(), &frame);
         assert_eq!(timeout.status, "[L1 UNVERIFIED]");
-        assert_eq!(timeout.text, L1_UNAVAILABLE_FALLBACK);
+        assert!(timeout.text.is_none());
 
         let repeated = validate_l1_explanation("to samo\nto samo\nto samo".to_owned(), &frame);
-        assert_eq!(repeated.text, L1_UNAVAILABLE_FALLBACK);
+        assert!(repeated.text.is_none());
 
         let unknown_pid =
             validate_l1_explanation("Przyczyna: proces cargo ma PID 99999.".to_owned(), &frame);
@@ -1896,8 +1898,11 @@ mod tests {
         assert_eq!(diagnosis.suggested_command(), "ubij 42");
         assert!(diagnosis.cause_facts.contains("768.0 MB/s"));
         assert!(diagnosis
-            .render("Przyczyna: proces cargo ma wysoki RSS.")
-            .contains("Sugerowana komenda: ubij 42"));
+            .render(Some("proces cargo ma wysoki RSS."))
+            .contains("Przyczyna: Sentinel raportuje"));
+        assert!(diagnosis
+            .render(Some("proces cargo ma wysoki RSS."))
+            .contains("Objaśnienie L1: proces cargo ma wysoki RSS."));
     }
 
     #[test]
