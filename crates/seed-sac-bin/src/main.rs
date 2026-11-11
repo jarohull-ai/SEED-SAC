@@ -71,6 +71,41 @@ struct PendingConfirmation {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SuggestedAction {
+    Ignore,
+    Kill(ProcessIdentity),
+    Freeze(ProcessIdentity),
+}
+
+#[derive(Debug, Clone)]
+struct DeterministicDiagnosis {
+    diagnosis: String,
+    cause_facts: String,
+    suggested_action: SuggestedAction,
+    allowed_pids: Vec<u32>,
+    allowed_process_names: Vec<String>,
+}
+
+impl DeterministicDiagnosis {
+    fn suggested_command(&self) -> String {
+        match &self.suggested_action {
+            SuggestedAction::Ignore => "ignoruj".to_owned(),
+            SuggestedAction::Kill(identity) => format!("ubij {}", identity.pid),
+            SuggestedAction::Freeze(identity) => format!("zamroz {}", identity.pid),
+        }
+    }
+
+    fn render(&self, cause: &str) -> String {
+        format!(
+            "Diagnoza: {}\nPrzyczyna: {}\nSugerowana komenda: {}",
+            self.diagnosis,
+            cause.trim().trim_start_matches("Przyczyna:").trim(),
+            self.suggested_command()
+        )
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
 
@@ -204,6 +239,7 @@ fn run_sentinel(
     let mut latest_snapshot: Option<SystemSnapshot> = None;
     let mut latest_deltas: Vec<ProcessDelta> = Vec::new();
     let mut latest_state = SystemState::Green;
+    let mut pending_l1_diagnosis: Option<(u64, DeterministicDiagnosis)> = None;
     while running.load(Ordering::Acquire) {
         if Instant::now() >= next_sample_at {
             let snapshot = sampler.poll();
@@ -333,8 +369,13 @@ fn run_sentinel(
 
         while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
             if generation == command_generation {
-                let validated = validate_l1_response(response);
-                let response_with_dlp = format_l1_response(validated.text, &dlp_report);
+                let diagnosis = pending_l1_diagnosis
+                    .take()
+                    .map(|(_, diagnosis)| diagnosis)
+                    .unwrap_or_else(|| deterministic_diagnosis(None, latest_state, &[], &alerts));
+                let validated = validate_l1_explanation(response, &diagnosis);
+                let rendered = diagnosis.render(&validated.text);
+                let response_with_dlp = format_l1_response(rendered, &dlp_report);
                 push_console(
                     &mut console,
                     "L1",
@@ -365,6 +406,13 @@ fn run_sentinel(
         while let Ok(UserCommand(text)) = command_rx.try_recv() {
             command_generation = command_generation.wrapping_add(1);
             banner = None;
+            let diagnosis = deterministic_diagnosis(
+                latest_snapshot.as_ref(),
+                latest_state,
+                &latest_deltas,
+                &alerts,
+            );
+            pending_l1_diagnosis = Some((command_generation, diagnosis.clone()));
             if let Some(response) = handle_command(
                 &text,
                 &l0_classifier,
@@ -379,6 +427,7 @@ fn run_sentinel(
                     latest_state,
                     &latest_deltas,
                     &alerts,
+                    &diagnosis,
                 )),
             ) {
                 push_console(&mut console, "ROUTER", LogLevel::Info, response.clone());
@@ -686,15 +735,140 @@ fn l0_classifier_config(config: &Config) -> l0::ClassifierConfig {
     }
 }
 
+fn system_state_name(state: SystemState) -> &'static str {
+    match state {
+        SystemState::Green => "GREEN",
+        SystemState::Yellow => "YELLOW",
+        SystemState::Red => "RED",
+    }
+}
+
+fn deterministic_diagnosis(
+    snapshot: Option<&SystemSnapshot>,
+    state: SystemState,
+    deltas: &[ProcessDelta],
+    alerts: &BTreeMap<u32, Alert>,
+) -> DeterministicDiagnosis {
+    let Some(snapshot) = snapshot else {
+        return DeterministicDiagnosis {
+            diagnosis: "Brak aktualnego snapshotu Sentinel — nie wykonano diagnozy.".to_owned(),
+            cause_facts: "Brak wystarczających danych telemetrycznych.".to_owned(),
+            suggested_action: SuggestedAction::Ignore,
+            allowed_pids: Vec::new(),
+            allowed_process_names: Vec::new(),
+        };
+    };
+
+    let allowed_pids = snapshot
+        .processes
+        .iter()
+        .map(|process| process.pid)
+        .collect();
+    let allowed_process_names = snapshot
+        .processes
+        .iter()
+        .map(|process| process.name.clone())
+        .collect();
+    let ram_pct = if snapshot.ram_total_bytes == 0 {
+        0.0
+    } else {
+        snapshot.ram_used_bytes as f64 * 100.0 / snapshot.ram_total_bytes as f64
+    };
+
+    let candidate = alerts
+        .keys()
+        .filter_map(|pid| {
+            snapshot
+                .processes
+                .iter()
+                .find(|process| process.pid == *pid)
+        })
+        .next()
+        .or_else(|| {
+            deltas
+                .iter()
+                .filter(|delta| delta.delta_bytes_per_sec > 0)
+                .max_by_key(|delta| delta.delta_bytes_per_sec)
+                .and_then(|delta| snapshot.processes.iter().find(|p| p.pid == delta.pid))
+        });
+
+    let Some(process) = candidate else {
+        return DeterministicDiagnosis {
+            diagnosis: format!(
+                "Stan zasobów jest {} bez procesu wskazanego jako sprawca wzrostu.",
+                system_state_name(state)
+            ),
+            cause_facts: format!(
+                "Snapshot Sentinel raportuje RAM {:.1}% i brak dodatniego przyrostu procesu.",
+                ram_pct
+            ),
+            suggested_action: SuggestedAction::Ignore,
+            allowed_pids,
+            allowed_process_names,
+        };
+    };
+
+    let growth_mb_s = deltas
+        .iter()
+        .find(|delta| delta.pid == process.pid)
+        .map(|delta| delta.delta_bytes_per_sec.max(0) as f64 / (1024.0 * 1024.0))
+        .unwrap_or(0.0);
+    let frozen = alerts.contains_key(&process.pid);
+    let identity = process.identity();
+    let status = if frozen { "FROZEN(SIGSTOP)" } else { "running" };
+    let diagnosis = match state {
+        SystemState::Red => format!(
+            "Wykryto krytyczny stan RED związany z procesem {} (PID {}).",
+            process.name, process.pid
+        ),
+        SystemState::Yellow => format!(
+            "Stan YELLOW wskazuje na podwyższone obciążenie procesu {} (PID {}).",
+            process.name, process.pid
+        ),
+        SystemState::Green => format!(
+            "System jest stabilny; proces {} (PID {}) nie wymaga interwencji.",
+            process.name, process.pid
+        ),
+    };
+    let cause_facts = format!(
+        "Sentinel raportuje RAM {:.1}%, proces {} (PID {}) ma RSS {:.1} MiB, przyrost {:.1} MB/s i status {}.",
+        ram_pct,
+        process.name,
+        process.pid,
+        process.rss_bytes as f64 / (1024.0 * 1024.0),
+        growth_mb_s,
+        status
+    );
+    let suggested_action = match state {
+        SystemState::Red => SuggestedAction::Kill(identity),
+        SystemState::Yellow if growth_mb_s > 0.0 && !frozen => SuggestedAction::Freeze(identity),
+        SystemState::Green | SystemState::Yellow => SuggestedAction::Ignore,
+    };
+
+    DeterministicDiagnosis {
+        diagnosis,
+        cause_facts,
+        suggested_action,
+        allowed_pids,
+        allowed_process_names,
+    }
+}
+
 fn l1_prompt_context(
     query: &str,
     snapshot: Option<&SystemSnapshot>,
     state: SystemState,
     deltas: &[ProcessDelta],
     alerts: &BTreeMap<u32, Alert>,
+    diagnosis: &DeterministicDiagnosis,
 ) -> String {
     let Some(snapshot) = snapshot else {
-        return format!("Sentinel context unavailable. User query:\n{query}");
+        return format!(
+            "Deterministic diagnosis: {}\nFacts: {}\nSuggested action: {}\nUser query:\n{query}",
+            diagnosis.diagnosis,
+            diagnosis.cause_facts,
+            diagnosis.suggested_command()
+        );
     };
     let ram_pct = if snapshot.ram_total_bytes == 0 {
         0.0
@@ -730,7 +904,11 @@ fn l1_prompt_context(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "Sentinel grounding snapshot: state={state:?}; CPU={:.1}%; RAM={:.1}% ({:.1}/{:.1} GiB); top 3 processes={}. Frozen processes are marked FROZEN(SIGSTOP).\nUser query:\n{query}",
+        "Deterministic diagnosis: {}\nDeterministic facts: {}\nDeterministic suggested action: {}\nSentinel grounding snapshot: state={}; CPU={:.1}%; RAM={:.1}% ({:.1}/{:.1} GiB); top 3 processes={}. Frozen processes are marked FROZEN(SIGSTOP).\nUser query:\n{query}",
+        diagnosis.diagnosis,
+        diagnosis.cause_facts,
+        diagnosis.suggested_command(),
+        system_state_name(state),
         snapshot.cpu_usage_pct,
         ram_pct,
         snapshot.ram_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -1229,38 +1407,90 @@ fn format_l1_response(response: String, report: &DLPReport) -> String {
     )
 }
 
-struct ValidatedL1Response {
+struct ValidatedL1Explanation {
     status: &'static str,
     text: String,
 }
 
 const L1_UNAVAILABLE_FALLBACK: &str =
-    "[L1 UNAVAILABLE] Brak merytorycznej odpowiedzi modelu. Sprawdź 'status' lokalny.";
+    "L1 niedostępne; pokazano wyłącznie deterministyczne fakty Sentinel.";
 
-fn validate_l1_response(response: String) -> ValidatedL1Response {
+fn validate_l1_explanation(
+    response: String,
+    diagnosis: &DeterministicDiagnosis,
+) -> ValidatedL1Explanation {
     let trimmed = response.trim();
     if trimmed.is_empty()
         || trimmed.starts_with("L1 request failed:")
         || trimmed.starts_with("L1 offline")
         || has_repeated_content(trimmed)
     {
-        return ValidatedL1Response {
+        return ValidatedL1Explanation {
             status: "[L1 UNVERIFIED]",
             text: L1_UNAVAILABLE_FALLBACK.to_owned(),
         };
     }
 
-    let structured = ["Diagnoza:", "Przyczyna:", "Sugerowana komenda:"]
-        .iter()
-        .all(|marker| trimmed.contains(marker));
-    ValidatedL1Response {
-        status: if structured {
-            "[L1 VERIFIED]"
-        } else {
-            "[L1 UNVERIFIED]"
-        },
-        text: trimmed.to_owned(),
+    let Some(cause) = trimmed.strip_prefix("Przyczyna:").map(str::trim) else {
+        return ValidatedL1Explanation {
+            status: "[L1 UNVERIFIED]",
+            text: L1_UNAVAILABLE_FALLBACK.to_owned(),
+        };
+    };
+    if cause.is_empty()
+        || trimmed.contains("Diagnoza:")
+        || trimmed.contains("Sugerowana komenda:")
+        || contains_unknown_entities(cause, diagnosis)
+    {
+        return ValidatedL1Explanation {
+            status: "[L1 UNVERIFIED]",
+            text: L1_UNAVAILABLE_FALLBACK.to_owned(),
+        };
     }
+    ValidatedL1Explanation {
+        status: "[L1 VERIFIED]",
+        text: cause.to_owned(),
+    }
+}
+
+fn contains_unknown_entities(text: &str, diagnosis: &DeterministicDiagnosis) -> bool {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    for (index, word) in words.iter().enumerate() {
+        let normalized = word.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        });
+        let lower = normalized.to_ascii_lowercase();
+        if lower == "pid" {
+            let Some(next) = words.get(index + 1) else {
+                return true;
+            };
+            let number = next.trim_matches(|character: char| !character.is_ascii_digit());
+            if number.is_empty()
+                || number
+                    .parse::<u32>()
+                    .map_or(true, |pid| !diagnosis.allowed_pids.contains(&pid))
+            {
+                return true;
+            }
+        }
+        if lower == "proces" || lower == "process" {
+            let Some(next) = words.get(index + 1) else {
+                return true;
+            };
+            let name = next.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+            });
+            if name.is_empty()
+                || !diagnosis
+                    .allowed_process_names
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(name))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn has_repeated_content(text: &str) -> bool {
@@ -1622,22 +1852,56 @@ mod tests {
 
     #[test]
     fn l1_validator_marks_structured_and_fallback_responses() {
-        let verified = validate_l1_response(
-            "Diagnoza: RAM rośnie.\nPrzyczyna: RSS PID 42 wzrósł.\nSugerowana komenda: ignoruj"
-                .to_owned(),
-        );
+        let frame =
+            deterministic_diagnosis(Some(&snapshot()), SystemState::Green, &[], &BTreeMap::new());
+        let verified =
+            validate_l1_explanation("Przyczyna: proces cargo ma RSS 512 MiB.".to_owned(), &frame);
         assert_eq!(verified.status, "[L1 VERIFIED]");
 
-        let timeout = validate_l1_response("L1 request failed: L1 request timed out".to_owned());
+        let timeout =
+            validate_l1_explanation("L1 request failed: L1 request timed out".to_owned(), &frame);
         assert_eq!(timeout.status, "[L1 UNVERIFIED]");
         assert_eq!(timeout.text, L1_UNAVAILABLE_FALLBACK);
 
-        let repeated = validate_l1_response("to samo\nto samo\nto samo".to_owned());
+        let repeated = validate_l1_explanation("to samo\nto samo\nto samo".to_owned(), &frame);
         assert_eq!(repeated.text, L1_UNAVAILABLE_FALLBACK);
+
+        let unknown_pid =
+            validate_l1_explanation("Przyczyna: proces cargo ma PID 99999.".to_owned(), &frame);
+        assert_eq!(unknown_pid.status, "[L1 UNVERIFIED]");
+
+        let model_owned_fields = validate_l1_explanation(
+            "Przyczyna: proces cargo rośnie.\nSugerowana komenda: ubij 42".to_owned(),
+            &frame,
+        );
+        assert_eq!(model_owned_fields.status, "[L1 UNVERIFIED]");
     }
 
     #[test]
-    fn user_scenario_matrix_50_inputs() {
+    fn deterministic_diagnosis_owns_action_and_facts() {
+        let process = snapshot().processes[0].clone();
+        let diagnosis = deterministic_diagnosis(
+            Some(&snapshot()),
+            SystemState::Red,
+            &[ProcessDelta {
+                pid: process.pid,
+                name: process.name.clone(),
+                start_time: process.start_time,
+                rss_bytes: process.rss_bytes,
+                delta_bytes_per_sec: 768 * 1024 * 1024,
+            }],
+            &BTreeMap::new(),
+        );
+        assert!(diagnosis.diagnosis.contains("PID 42"));
+        assert_eq!(diagnosis.suggested_command(), "ubij 42");
+        assert!(diagnosis.cause_facts.contains("768.0 MB/s"));
+        assert!(diagnosis
+            .render("Przyczyna: proces cargo ma wysoki RSS.")
+            .contains("Sugerowana komenda: ubij 42"));
+    }
+
+    #[test]
+    fn user_scenario_matrix_60_inputs() {
         let inputs = [
             "pomoc",
             "help",
@@ -1689,8 +1953,18 @@ mod tests {
             "raport",
             "sprawdz system",
             "jaki jest stan?",
+            "pamięć",
+            "lista procesów",
+            "UBIJ chrome",
+            "zamroź firefox",
+            "dlaczego pamięć rośnie?",
+            "co obciąża CPU?",
+            "wyjaśnij wzrost RAM",
+            "czy jest problem?",
+            "opisz sytuację",
+            "co się stało?",
         ];
-        assert_eq!(inputs.len(), 50);
+        assert_eq!(inputs.len(), 60);
 
         let config = Config::default();
         let classifier = l0::IntentClassifier::new(l0_classifier_config(&config));
@@ -1703,8 +1977,10 @@ mod tests {
             "procesy",
             "processes",
             "lista procesow",
+            "lista procesów",
             "ram",
             "pamiec",
+            "pamięć",
             "cpu",
             "procesor",
         ];
@@ -1739,9 +2015,9 @@ mod tests {
         }
 
         assert_eq!(help_answers, 5);
-        assert_eq!(local_answers, 11);
-        assert_eq!(routed_commands, 19);
-        assert_eq!(l1_questions, 15);
+        assert_eq!(local_answers, 13);
+        assert_eq!(routed_commands, 21);
+        assert_eq!(l1_questions, 21);
     }
 
     #[test]

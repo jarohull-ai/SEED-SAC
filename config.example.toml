@@ -63,7 +63,7 @@ model = "Ling-3.0-tiny"
 timeout_ms = 5000
 
 # Maximum tokens in response
-max_tokens = 512
+max_tokens = 4096
 
 # Temperature (0.0 = deterministic, 1.0 = creative)
 temperature = 0.2

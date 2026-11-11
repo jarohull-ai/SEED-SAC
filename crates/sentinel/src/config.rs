@@ -77,7 +77,7 @@ impl Default for L1ProviderConfig {
             base_url: "http://127.0.0.1:1234/v1".to_owned(),
             model: "Ling-3.0-tiny".to_owned(),
             timeout_ms: 5_000,
-            max_tokens: 512,
+            max_tokens: 4096,
             temperature: 0.2,
         }
     }
@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(config.l1_provider.base_url, "http://127.0.0.1:1234/v1");
         assert_eq!(config.l1_provider.model, "Ling-3.0-tiny");
         assert_eq!(config.l1_provider.timeout_ms, 5_000);
-        assert_eq!(config.l1_provider.max_tokens, 512);
+        assert_eq!(config.l1_provider.max_tokens, 4096);
         assert_eq!(config.l1_provider.temperature, 0.2);
     }
 
@@ -402,7 +402,7 @@ mod tests {
         assert_eq!(config.l1_provider.model, "custom-model");
         assert_eq!(config.l1_provider.timeout_ms, 9000);
         assert_eq!(config.l1_provider.backend, "openai_compatible");
-        assert_eq!(config.l1_provider.max_tokens, 512);
+        assert_eq!(config.l1_provider.max_tokens, 4096);
     }
 
     #[test]

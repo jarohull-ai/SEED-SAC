@@ -16,7 +16,7 @@ const DEFAULT_TEMPERATURE: f32 = 0.2;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
-const SYSTEM_GUIDANCE: &str = "You are SEED SAC's local Linux system copilot. Use only the Sentinel grounding snapshot supplied by the user message. Answer the exact question and do not invent a different topic. Return exactly three lines: Diagnoza: <one concise sentence>; Przyczyna: <one fact from telemetry>; Sugerowana komenda: <one safe command such as 'ubij <PID>', 'drop cache', or 'ignoruj'>. If telemetry is insufficient, say so in those three lines and use 'ignoruj' rather than inventing facts. Never claim to have executed a command.";
+const SYSTEM_GUIDANCE: &str = "You are SEED SAC's local Linux explanation service. The Rust Sentinel has already decided the diagnosis and suggested action. Explain only the supplied telemetry in one concise line beginning with 'Przyczyna:'. Do not invent processes, PIDs, causes, metrics, commands, or actions. Do not output 'Diagnoza:' or 'Sugerowana komenda:'. Never claim to have executed anything. If the telemetry is insufficient, say 'Przyczyna: Brak wystarczających danych telemetrycznych.'";
 
 /// Configuration for one L1 client.
 #[derive(Debug, Clone)]
