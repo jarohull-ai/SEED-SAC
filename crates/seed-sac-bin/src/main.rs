@@ -245,6 +245,7 @@ fn run_sentinel(
     let mut latest_deltas: Vec<ProcessDelta> = Vec::new();
     let mut latest_state = SystemState::Green;
     let mut pending_l1_diagnosis: Option<(u64, DeterministicDiagnosis)> = None;
+    let mut state_dirty = true;
     while running.load(Ordering::Acquire) {
         if Instant::now() >= next_sample_at {
             let snapshot = sampler.poll();
@@ -369,6 +370,7 @@ fn run_sentinel(
             latest_snapshot = Some(snapshot);
             latest_deltas = deltas;
             latest_state = state;
+            state_dirty = true;
             next_sample_at = Instant::now() + poll_interval;
         }
 
@@ -403,6 +405,7 @@ fn run_sentinel(
                     format!("{}\n{}", validated.status, response_with_dlp),
                     Instant::now(),
                 ));
+                state_dirty = true;
             }
         }
 
@@ -438,6 +441,7 @@ fn run_sentinel(
                 push_console(&mut console, "ROUTER", LogLevel::Info, response.clone());
                 banner = Some(CommandBanner::new(response, Instant::now()));
             }
+            state_dirty = true;
             tracing::info!("HUD command handled");
         }
 
@@ -450,32 +454,36 @@ fn run_sentinel(
                 "Potwierdzenie wygasło — akcja nie została wykonana".to_owned(),
                 Instant::now(),
             ));
+            state_dirty = true;
         }
 
-        shared_state.store(Arc::new(display_state(
-            latest_snapshot
-                .as_ref()
-                .expect("sentinel samples before publishing display state"),
-            latest_state,
-            &alerts,
-            banner.as_ref().map(|banner| banner.text.as_str()),
-            &config,
-            &console,
-            Some(&deterministic_diagnosis(
-                latest_snapshot.as_ref(),
-                latest_state,
-                &latest_deltas,
-                &alerts,
-            )),
-        )));
-
-        // Age the reply only after it has been published, so it stays visible
-        // for a full TTL window.
+        // Expire transient replies before publishing the next state snapshot.
         if banner
             .as_ref()
             .is_some_and(|banner| banner.is_expired(Instant::now()))
         {
             banner = None;
+            state_dirty = true;
+        }
+
+        if state_dirty {
+            shared_state.store(Arc::new(display_state(
+                latest_snapshot
+                    .as_ref()
+                    .expect("sentinel samples before publishing display state"),
+                latest_state,
+                &alerts,
+                banner.as_ref().map(|banner| banner.text.as_str()),
+                &config,
+                &console,
+                Some(&deterministic_diagnosis(
+                    latest_snapshot.as_ref(),
+                    latest_state,
+                    &latest_deltas,
+                    &alerts,
+                )),
+            )));
+            state_dirty = false;
         }
 
         let wait_for = sentinel_wait_duration(next_sample_at, Instant::now());
@@ -509,6 +517,7 @@ fn run_sentinel(
                 if let Some(response) = response {
                     banner = Some(CommandBanner::new(response.clone(), Instant::now()));
                     push_console(&mut console, "SENTINEL", LogLevel::Info, response);
+                    state_dirty = true;
                 } else if was_resume {
                     push_console(
                         &mut console,
@@ -516,6 +525,7 @@ fn run_sentinel(
                         LogLevel::Info,
                         "[SIGCONT] Proces wznowiony".to_owned(),
                     );
+                    state_dirty = true;
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

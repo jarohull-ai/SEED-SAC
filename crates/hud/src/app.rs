@@ -381,7 +381,10 @@ impl SacApp {
             });
         }
 
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Telemetry is sampled by Sentinel every 250 ms.  Repainting ten
+        // times per second made the console appear to flicker even when the
+        // published state had not changed.
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 }
 
