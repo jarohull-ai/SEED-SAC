@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:1234/v1";
 const DEFAULT_MODEL: &str = "local-model";
-const DEFAULT_MAX_TOKENS: u32 = 512;
+const DEFAULT_MAX_TOKENS: u32 = 1024;
 const DEFAULT_TEMPERATURE: f32 = 0.2;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
@@ -121,7 +121,10 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct Message {
+    #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 impl L1Client {
@@ -172,7 +175,7 @@ impl L1Client {
                 {"role": "system", "content": SYSTEM_GUIDANCE},
                 {"role": "user", "content": sanitized},
             ],
-            "max_tokens": self.config.max_tokens,
+            "max_tokens": self.config.max_tokens.max(1024),
             "temperature": self.config.temperature,
             "stream": false,
         });
@@ -192,12 +195,26 @@ impl L1Client {
             .read_json()
             .map_err(|_| L1Error::InvalidResponse)?;
 
-        let content = parsed
+        let message = parsed
             .choices
             .into_iter()
             .next()
-            .and_then(|choice| choice.message.content)
-            .filter(|c| !c.trim().is_empty())
+            .map(|choice| choice.message)
+            .ok_or(L1Error::InvalidResponse)?;
+
+        let content = message
+            .content
+            .filter(|content| !content.trim().is_empty())
+            .or_else(|| {
+                let reasoning = message.reasoning_content;
+                if reasoning
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty())
+                {
+                    tracing::warn!("L1 returned empty content, falling back to reasoning_content");
+                }
+                reasoning.filter(|content| !content.trim().is_empty())
+            })
             .ok_or(L1Error::InvalidResponse)?;
 
         Ok(content)
@@ -429,6 +446,44 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Diagnoza:"));
+        assert!(body["max_tokens"].as_u64().unwrap() >= 1024);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_reasoning_content_when_content_is_empty() {
+        let (endpoint, server) = local_server(
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"Diagnoza: RAM rośnie.\nPrzyczyna: proces ma wysoki RSS.\nSugerowana komenda: ignoruj"}}]}"#,
+        );
+        let client = L1Client::new(L1Config {
+            endpoint,
+            max_tokens: 512,
+            ..L1Config::default()
+        })
+        .unwrap();
+
+        let completion = client.complete("co dzieje się z pamięcią?");
+        assert_eq!(
+            completion.response.unwrap(),
+            "Diagnoza: RAM rośnie.\nPrzyczyna: proces ma wysoki RSS.\nSugerowana komenda: ignoruj"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_response_when_content_and_reasoning_are_empty() {
+        let (endpoint, server) =
+            local_server(r#"{"choices":[{"message":{"content":"   ","reasoning_content":""}}]}"#);
+        let client = L1Client::new(L1Config {
+            endpoint,
+            ..L1Config::default()
+        })
+        .unwrap();
+
+        assert!(matches!(
+            client.complete("status").response,
+            Err(L1Error::InvalidResponse)
+        ));
         server.join().unwrap();
     }
 }
