@@ -16,6 +16,7 @@ Cargo.lock
 .sublime-*
 
 # Environment & Configuration
+.venv-l0/
 .env
 .env.local
 .env.*.local

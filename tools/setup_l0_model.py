@@ -72,7 +72,7 @@ def dependencies():
     except ImportError as error:
         raise SystemExit(
             "Missing Python dependencies. Install in a virtual environment: "
-            "python -m pip install torch transformers onnx onnxruntime numpy"
+            "python -m pip install -r tools/requirements-l0.txt"
         ) from error
     return numpy, onnx, onnxruntime, torch, transformers, QuantType, quantize_dynamic
 
@@ -173,7 +173,9 @@ def ort_inputs(tokenizer, text: str):
     }
 
 
-def verify_model(numpy, onnxruntime, tokenizer, model_path: Path):
+def verify_model(
+    numpy, onnxruntime, tokenizer, model_path: Path, confidence_threshold: float
+):
     session = onnxruntime.InferenceSession(
         str(model_path), providers=["CPUExecutionProvider"]
     )
@@ -181,11 +183,19 @@ def verify_model(numpy, onnxruntime, tokenizer, model_path: Path):
     for text, expected in VALIDATION_EXAMPLES:
         logits = session.run(["logits"], ort_inputs(tokenizer, text))[0][0]
         actual = int(numpy.argmax(logits))
+        probabilities = numpy.exp(logits - numpy.max(logits))
+        probabilities /= numpy.sum(probabilities)
+        confidence = float(probabilities[actual])
         if actual != expected:
             raise RuntimeError(
                 f"validation failed for {text!r}: expected {expected}, got {actual}"
             )
-        observed.append((text, actual))
+        if confidence < confidence_threshold:
+            raise RuntimeError(
+                f"validation confidence for {text!r} is {confidence:.3f}, "
+                f"below {confidence_threshold:.3f}"
+            )
+        observed.append((text, actual, round(confidence, 3)))
 
     warmup = ort_inputs(tokenizer, "why is CPU high?")
     session.run(["logits"], warmup)
@@ -201,14 +211,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, default=default_output_dir())
     parser.add_argument("--model-id", default="prajjwal1/bert-tiny")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-size-mb", type=float, default=20.0)
+    parser.add_argument("--confidence-threshold", type=float, default=0.65)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     if args.epochs < 1:
         raise SystemExit("--epochs must be positive")
+    if not 0.0 <= args.confidence_threshold <= 1.0:
+        raise SystemExit("--confidence-threshold must be between 0 and 1")
     output_dir = args.output_dir.expanduser().resolve()
     model_path = output_dir / "intent.onnx"
     tokenizer_path = output_dir / "tokenizer.json"
@@ -243,7 +256,11 @@ def main() -> None:
                 f"quantized model is {size_mb:.2f} MiB, limit is {args.max_size_mb:.2f} MiB"
             )
         observed, median_ms = verify_model(
-            numpy, onnxruntime, tokenizer, int8_path
+            numpy,
+            onnxruntime,
+            tokenizer,
+            int8_path,
+            args.confidence_threshold,
         )
         os.replace(int8_path, model_path)
         os.replace(exported_tokenizer, tokenizer_path)
