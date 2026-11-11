@@ -2,11 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use crate::{indicators, notifications, SharedDisplayState, UserCommand};
+use crate::{indicators, notifications, ConsoleEntry, LogLevel, SharedDisplayState, UserCommand};
 
 const MAX_COMMAND_INPUT_CHARS: usize = 4096;
 const CONFIRM_COMMAND: &str = "__sac_confirm";
 const CANCEL_COMMAND: &str = "__sac_cancel";
+const HELP_COMMAND: &str = "__sac_help";
 
 /// Action requested by the user from the HUD, sent back to the sentinel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +115,12 @@ impl SacApp {
 
 impl eframe::App for SacApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render(ctx);
+    }
+}
+
+impl SacApp {
+    fn render(&mut self, ctx: &egui::Context) {
         let state = self.state.load_full();
         let confirmation_visible = state
             .command_response
@@ -127,6 +134,61 @@ impl eframe::App for SacApp {
                 indicators::draw_status_bar(ui, &state);
             });
 
+        egui::TopBottomPanel::bottom("sac_live_console")
+            .resizable(true)
+            .default_height(170.0)
+            .min_height(72.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Live Console");
+                    ui.label("historia zdarzeń i pełne odpowiedzi L1");
+                    if ui.small_button("Kopiuj L1").clicked() {
+                        let text = state
+                            .console
+                            .iter()
+                            .filter(|entry| entry.source == "L1")
+                            .map(|entry| entry.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        if !text.is_empty() {
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                    if ui.small_button("Kopiuj system").clicked() {
+                        let text = state
+                            .console
+                            .iter()
+                            .filter(|entry| entry.source != "L1")
+                            .map(|entry| format!("[{}] {}", entry.source, entry.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.is_empty() {
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                    if ui.small_button("Kopiuj wszystko").clicked() {
+                        let text = state
+                            .console
+                            .iter()
+                            .map(|entry| format!("[{}] {}", entry.source, entry.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.is_empty() {
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("sac_live_console_scroll")
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for entry in &state.console {
+                            draw_console_entry(ui, entry);
+                        }
+                    });
+            });
+
         egui::TopBottomPanel::bottom("sac_input_bar")
             .resizable(false)
             .show(ctx, |ui| {
@@ -134,9 +196,13 @@ impl eframe::App for SacApp {
                 self.enforce_input_limit();
                 ui.horizontal(|ui| {
                     let button_width = 96.0;
+                    let help_button_width = 112.0;
                     let response = ui.add_sized(
                         [
-                            (ui.available_width() - button_width - ui.spacing().item_spacing.x)
+                            (ui.available_width()
+                                - button_width
+                                - help_button_width
+                                - 2.0 * ui.spacing().item_spacing.x)
                                 .max(1.0),
                             0.0,
                         ],
@@ -163,6 +229,12 @@ impl eframe::App for SacApp {
                             egui::Button::new("Wyślij"),
                         )
                         .clicked();
+                    let help_clicked = ui
+                        .add_sized(
+                            [help_button_width, response.rect.height()],
+                            egui::Button::new("Polecenia"),
+                        )
+                        .clicked();
 
                     if enter_pressed
                         && confirmation_visible
@@ -171,6 +243,10 @@ impl eframe::App for SacApp {
                     {
                         submitted = true;
                         self.submit_confirmation(CONFIRM_COMMAND);
+                        response.request_focus();
+                    } else if help_clicked && !submitted {
+                        submitted = true;
+                        let _ = self.command_tx.send(UserCommand(HELP_COMMAND.to_owned()));
                         response.request_focus();
                     } else if (enter_pressed || send_clicked) && !submitted {
                         submitted = true;
@@ -258,6 +334,29 @@ impl eframe::App for SacApp {
 
         ctx.request_repaint_after(Duration::from_millis(100));
     }
+}
+
+fn draw_console_entry(ui: &mut egui::Ui, entry: &ConsoleEntry) {
+    let color = match entry.level {
+        LogLevel::Info => egui::Color32::LIGHT_GRAY,
+        LogLevel::L1Response => egui::Color32::from_rgb(130, 200, 255),
+        LogLevel::Warning => egui::Color32::from_rgb(255, 196, 90),
+        LogLevel::Alert => egui::Color32::from_rgb(255, 110, 110),
+    };
+    ui.horizontal_top(|ui| {
+        ui.label(
+            egui::RichText::new(format!("[{}]", entry.source))
+                .color(color)
+                .strong(),
+        );
+        ui.add(
+            egui::Label::new(egui::RichText::new(&entry.text).color(color))
+                .wrap_mode(egui::TextWrapMode::Wrap),
+        );
+        if ui.small_button("Kopiuj").clicked() {
+            ui.ctx().copy_text(entry.text.clone());
+        }
+    });
 }
 
 #[cfg(test)]
@@ -366,5 +465,31 @@ mod tests {
         app.sync_alert_action_state(&state);
 
         assert!(!app.alert_action_in_flight);
+    }
+
+    #[test]
+    fn egui_frame_renders_console_and_confirmation_flow() {
+        let (action_tx, _action_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        let shared = crate::new_shared_state();
+        let mut state = crate::DisplayState {
+            command_response: Some("POTWIERDZENIE: kill".to_owned()),
+            ..crate::DisplayState::default()
+        };
+        state.console.push_back(crate::ConsoleEntry {
+            timestamp: std::time::Instant::now(),
+            source: "L1",
+            level: crate::LogLevel::L1Response,
+            text: "Diagnoza: test".to_owned(),
+        });
+        shared.store(std::sync::Arc::new(state));
+        let mut app = SacApp::new(shared, action_tx, command_tx);
+
+        let context = egui::Context::default();
+        let output = context.run(Default::default(), |ctx| app.render(ctx));
+        assert!(!output.shapes.is_empty());
+
+        app.submit_confirmation(CONFIRM_COMMAND);
+        assert_eq!(command_rx.try_recv().unwrap().0, CONFIRM_COMMAND);
     }
 }

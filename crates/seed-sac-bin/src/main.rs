@@ -12,7 +12,7 @@
 //! Keeping telemetry off the UI thread means a slow `/proc` read or a stalled
 //! `renice` never freezes the window.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 use tracing_subscriber::EnvFilter;
 
 use hud::{
-    Alert, AlertAction, DisplayState, DisplayThresholds, SacApp, SharedDisplayState, UserAction,
-    UserCommand,
+    Alert, AlertAction, ConsoleEntry, DisplayState, DisplayThresholds, LogLevel, SacApp,
+    SharedDisplayState, UserAction, UserCommand,
 };
 use memory::{EventRecorder, EventType, EventWriter, SystemEvent};
 use router::executor::ExecResult;
@@ -33,7 +33,7 @@ use sentinel::guard::{self, GuardAction};
 use sentinel::process::ProcessTracker;
 use sentinel::sampler::Sampler;
 use sentinel::ProcessIdentity;
-use sentinel::{policy, SystemSnapshot, SystemState};
+use sentinel::{policy, ProcessDelta, SystemSnapshot, SystemState};
 
 /// Smallest poll interval we accept, to keep a malformed config from turning
 /// the sentinel into a busy loop.
@@ -47,10 +47,11 @@ const MAX_POLL_INTERVAL_MS: u64 = 5_000;
 const COMMAND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a router reply stays visible in the HUD.
-const COMMAND_RESPONSE_TTL: Duration = Duration::from_secs(5);
+const COMMAND_RESPONSE_TTL: Duration = Duration::from_secs(15);
 const L1_OFFLINE_MESSAGE: &str = "L1 offline (LM Studio niedostępne na porcie 1234)";
 const CONFIRM_COMMAND: &str = "__sac_confirm";
 const CANCEL_COMMAND: &str = "__sac_cancel";
+const HELP_COMMAND: &str = "__sac_help";
 const CONFIRMATION_TTL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,8 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("SAC · System-Aware Copilot")
-            .with_inner_size([600.0, 120.0])
-            .with_min_inner_size([480.0, 100.0])
+            .with_inner_size([760.0, 520.0])
+            .with_min_inner_size([560.0, 320.0])
             .with_always_on_top()
             .with_decorations(true)
             .with_resizable(true),
@@ -155,7 +156,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,seed_sac=debug,l0=debug"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -192,6 +194,7 @@ fn run_sentinel(
     let mut alerts: BTreeMap<u32, Alert> = BTreeMap::new();
     let mut alert_targets: BTreeMap<u32, ProcessIdentity> = BTreeMap::new();
     let mut banner: Option<CommandBanner> = None;
+    let mut console = VecDeque::with_capacity(100);
     let mut l1_worker =
         L1Worker::spawn_with_audit(&config, event_writer.as_ref().map(EventWriter::recorder));
     let l0_classifier = l0::IntentClassifier::new(l0_classifier_config(&config));
@@ -199,6 +202,7 @@ fn run_sentinel(
     let mut pending_confirmation: Option<PendingConfirmation> = None;
     let mut next_sample_at = Instant::now();
     let mut latest_snapshot: Option<SystemSnapshot> = None;
+    let mut latest_deltas: Vec<ProcessDelta> = Vec::new();
     let mut latest_state = SystemState::Green;
     while running.load(Ordering::Acquire) {
         if Instant::now() >= next_sample_at {
@@ -209,6 +213,21 @@ fn run_sentinel(
 
             // Log state transitions
             if state != latest_state {
+                let state_name = match state {
+                    SystemState::Green => "GREEN",
+                    SystemState::Yellow => "YELLOW",
+                    SystemState::Red => "RED",
+                };
+                push_console(
+                    &mut console,
+                    "SENTINEL",
+                    if state == SystemState::Red {
+                        LogLevel::Alert
+                    } else {
+                        LogLevel::Info
+                    },
+                    format!("Stan zasobów: {state_name}"),
+                );
                 let event_type = match state {
                     SystemState::Yellow => Some(EventType::YellowEnter),
                     SystemState::Red => Some(EventType::RedEnter),
@@ -248,6 +267,12 @@ fn run_sentinel(
                         if let GuardAction::Freeze { pid } = *action {
                             let name = process_name(&snapshot, pid);
                             tracing::warn!(pid, process = %name, "froze process to prevent OOM");
+                            push_console(
+                                &mut console,
+                                "SENTINEL",
+                                LogLevel::Alert,
+                                format!("[SIGSTOP] Frozen PID {pid} ({name})"),
+                            );
 
                             // Log SIGSTOP event
                             if let Some(writer) = &event_writer {
@@ -301,14 +326,37 @@ fn run_sentinel(
             alerts.retain(|pid, _| snapshot.processes.iter().any(|process| process.pid == *pid));
             alert_targets.retain(|pid, _| alerts.contains_key(pid));
             latest_snapshot = Some(snapshot);
+            latest_deltas = deltas;
             latest_state = state;
             next_sample_at = Instant::now() + poll_interval;
         }
 
         while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
             if generation == command_generation {
-                let response_with_dlp = format_l1_response(response, &dlp_report);
-                banner = Some(CommandBanner::new(response_with_dlp, Instant::now()));
+                let validated = validate_l1_response(response);
+                let response_with_dlp = format_l1_response(validated.text, &dlp_report);
+                push_console(
+                    &mut console,
+                    "L1",
+                    LogLevel::L1Response,
+                    format!("{}\n{}", validated.status, response_with_dlp),
+                );
+                if dlp_report.redaction_count > 0 {
+                    push_console(
+                        &mut console,
+                        "DLP",
+                        LogLevel::Warning,
+                        format!(
+                            "Redacted {} items ({})",
+                            dlp_report.redaction_count,
+                            dlp_report.rules_applied.join(", ")
+                        ),
+                    );
+                }
+                banner = Some(CommandBanner::new(
+                    format!("{}\n{}", validated.status, response_with_dlp),
+                    Instant::now(),
+                ));
             }
         }
 
@@ -325,7 +373,15 @@ fn run_sentinel(
                 command_generation,
                 latest_snapshot.as_ref(),
                 &mut pending_confirmation,
+                Some(&l1_prompt_context(
+                    &text,
+                    latest_snapshot.as_ref(),
+                    latest_state,
+                    &latest_deltas,
+                    &alerts,
+                )),
             ) {
+                push_console(&mut console, "ROUTER", LogLevel::Info, response.clone());
                 banner = Some(CommandBanner::new(response, Instant::now()));
             }
             tracing::info!("HUD command handled");
@@ -350,6 +406,7 @@ fn run_sentinel(
             &alerts,
             banner.as_ref().map(|banner| banner.text.as_str()),
             &config,
+            &console,
         )));
 
         // Age the reply only after it has been published, so it stays visible
@@ -364,6 +421,7 @@ fn run_sentinel(
         let wait_for = sentinel_wait_duration(next_sample_at, Instant::now());
         match action_rx.recv_timeout(wait_for) {
             Ok(action) => {
+                let was_resume = matches!(action, UserAction::Resume(_));
                 if let Some(response) = handle_user_action(
                     action,
                     latest_snapshot.as_ref(),
@@ -373,7 +431,15 @@ fn run_sentinel(
                     &mut pending_confirmation,
                     &event_writer,
                 ) {
-                    banner = Some(CommandBanner::new(response, Instant::now()));
+                    banner = Some(CommandBanner::new(response.clone(), Instant::now()));
+                    push_console(&mut console, "SENTINEL", LogLevel::Info, response);
+                } else if was_resume {
+                    push_console(
+                        &mut console,
+                        "SENTINEL",
+                        LogLevel::Info,
+                        "[SIGCONT] Proces wznowiony".to_owned(),
+                    );
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -415,6 +481,7 @@ fn run_sentinel(
 
 /// Route a HUD command through the router and render its result as text for
 /// the HUD.
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     text: &str,
     classifier: &l0::IntentClassifier,
@@ -423,6 +490,7 @@ fn handle_command(
     generation: u64,
     snapshot: Option<&SystemSnapshot>,
     pending_confirmation: &mut Option<PendingConfirmation>,
+    l1_context: Option<&str>,
 ) -> Option<String> {
     // Handle confirmation/cancellation commands first (no L0 classification needed)
     if text.trim() == CONFIRM_COMMAND {
@@ -440,6 +508,17 @@ fn handle_command(
         }
         return Some("Brak oczekującej akcji do anulowania".to_owned());
     }
+    if matches!(
+        text.trim().to_lowercase().as_str(),
+        HELP_COMMAND | "help" | "pomoc" | "komendy" | "commands" | "?"
+    ) {
+        pending_confirmation.take();
+        return Some(executable_commands_help());
+    }
+    if let Some(response) = local_system_response(text, snapshot) {
+        pending_confirmation.take();
+        return Some(response);
+    }
 
     // Triage: L0 intent classification for regular commands
     let intent = classifier.classify(text);
@@ -449,7 +528,7 @@ fn handle_command(
             pending_confirmation.take();
             // Fallback: check if router recognizes it as a command
             if let router::Action::QueryL1(query) = router::parse(text) {
-                if !l1_worker.submit(query, generation) {
+                if !l1_worker.submit(l1_context.unwrap_or(&query).to_owned(), generation) {
                     return Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned());
                 }
                 return Some("L1: oczekiwanie na lokalny model…".to_owned());
@@ -458,7 +537,7 @@ fn handle_command(
         l0::Intent::Analysis { .. } => {
             pending_confirmation.take();
             // Submit to L1 worker
-            if !l1_worker.submit(text.to_owned(), generation) {
+            if !l1_worker.submit(l1_context.unwrap_or(text).to_owned(), generation) {
                 return Some("L1 busy — polecenie nie zostało zakolejkowane".to_owned());
             }
             return Some("L1: oczekiwanie na lokalny model…".to_owned());
@@ -522,6 +601,81 @@ fn handle_command(
     execute_command_action(action, l1_worker, config, generation)
 }
 
+fn local_system_response(text: &str, snapshot: Option<&SystemSnapshot>) -> Option<String> {
+    let normalized = text
+        .trim()
+        .to_lowercase()
+        .trim_end_matches(['?', '!'])
+        .to_owned();
+    let kind = match normalized.as_str() {
+        "status" | "stan systemu" | "system" | "monitoring" => "status",
+        "procesy" | "processes" | "lista procesow" | "lista procesów" => "processes",
+        "ram" | "pamiec" | "pamięć" => "ram",
+        "cpu" | "procesor" => "cpu",
+        _ => return None,
+    };
+    let Some(snapshot) = snapshot else {
+        return Some("Sentinel nie dostarczył jeszcze snapshotu systemu.".to_owned());
+    };
+    let ram_pct = if snapshot.ram_total_bytes == 0 {
+        0.0
+    } else {
+        snapshot.ram_used_bytes as f64 * 100.0 / snapshot.ram_total_bytes as f64
+    };
+    match kind {
+        "status" => Some(format!(
+            "Lokalny status Sentinel:\nCPU: {:.1}%\nRAM: {:.1}% ({:.1}/{:.1} GiB)\nProcesów: {}",
+            snapshot.cpu_usage_pct,
+            ram_pct,
+            snapshot.ram_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            snapshot.ram_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            snapshot.processes.len()
+        )),
+        "ram" => Some(format!(
+            "RAM: {:.1}% ({:.1}/{:.1} GiB)",
+            ram_pct,
+            snapshot.ram_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            snapshot.ram_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+        )),
+        "cpu" => Some(format!("CPU: {:.1}%", snapshot.cpu_usage_pct)),
+        "processes" => {
+            let mut processes = snapshot.processes.iter().collect::<Vec<_>>();
+            processes.sort_by_key(|process| std::cmp::Reverse(process.rss_bytes));
+            let lines = processes
+                .into_iter()
+                .take(10)
+                .map(|process| {
+                    format!(
+                        "{} (PID {}, RSS {:.1} MiB, CPU {:.1}%)",
+                        process.name,
+                        process.pid,
+                        process.rss_bytes as f64 / (1024.0 * 1024.0),
+                        process.cpu_pct
+                    )
+                })
+                .collect::<Vec<_>>();
+            Some(if lines.is_empty() {
+                "Brak procesów w snapshotcie Sentinel.".to_owned()
+            } else {
+                format!("Procesy wg RSS:\n{}", lines.join("\n"))
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn executable_commands_help() -> String {
+    "Wykonywalne polecenia SAC:\n\
+     • zabij/ubij/kill <proces> — zakończ proces (wymaga potwierdzenia)\n\
+     • zamroz/freeze/pause <proces> — zamroź proces (SIGSTOP)\n\
+     • wznow/resume/unpause <PID> — wznów proces (SIGCONT)\n\
+     • wyczysc cache/drop caches — wyczyść page cache (wymaga potwierdzenia)\n\
+     • pomoc/help/komendy — pokaż tę listę\n\
+Pytania opisowe są przekazywane do lokalnego L1 i nie wykonują zmian same z siebie.\n\
+Przy zamrożonym procesie możesz też użyć przycisków Wznów/Zakończ w alercie."
+        .to_owned()
+}
+
 fn l0_classifier_config(config: &Config) -> l0::ClassifierConfig {
     let model_path = config.l0.model_path.trim();
     l0::ClassifierConfig {
@@ -530,6 +684,59 @@ fn l0_classifier_config(config: &Config) -> l0::ClassifierConfig {
         confidence_threshold: config.l0.confidence_threshold,
         verbose: false,
     }
+}
+
+fn l1_prompt_context(
+    query: &str,
+    snapshot: Option<&SystemSnapshot>,
+    state: SystemState,
+    deltas: &[ProcessDelta],
+    alerts: &BTreeMap<u32, Alert>,
+) -> String {
+    let Some(snapshot) = snapshot else {
+        return format!("Sentinel context unavailable. User query:\n{query}");
+    };
+    let ram_pct = if snapshot.ram_total_bytes == 0 {
+        0.0
+    } else {
+        snapshot.ram_used_bytes as f64 * 100.0 / snapshot.ram_total_bytes as f64
+    };
+    let mut processes = snapshot.processes.iter().collect::<Vec<_>>();
+    processes.sort_by_key(|process| std::cmp::Reverse(process.rss_bytes));
+    let top_processes = processes
+        .into_iter()
+        .take(3)
+        .map(|process| {
+            let growth_mb_s = deltas
+                .iter()
+                .find(|delta| delta.pid == process.pid)
+                .map(|delta| delta.delta_bytes_per_sec as f64 / (1024.0 * 1024.0))
+                .unwrap_or(0.0);
+            let process_state = if alerts.contains_key(&process.pid) {
+                "FROZEN(SIGSTOP)"
+            } else {
+                "running"
+            };
+            format!(
+                "{} (PID {}, RSS {:.1} MiB, CPU {:.1}%, growth {:.1} MB/s, status {})",
+                process.name,
+                process.pid,
+                process.rss_bytes as f64 / (1024.0 * 1024.0),
+                process.cpu_pct,
+                growth_mb_s,
+                process_state
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Sentinel grounding snapshot: state={state:?}; CPU={:.1}%; RAM={:.1}% ({:.1}/{:.1} GiB); top 3 processes={}. Frozen processes are marked FROZEN(SIGSTOP).\nUser query:\n{query}",
+        snapshot.cpu_usage_pct,
+        ram_pct,
+        snapshot.ram_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        snapshot.ram_total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        top_processes
+    )
 }
 
 fn is_destructive(action: &router::Action) -> bool {
@@ -681,19 +888,6 @@ impl L1Worker {
         thread::Builder::new()
             .name("l1-client".to_owned())
             .spawn(move || {
-                let client = if provider.enabled && provider.backend == "openai_compatible" {
-                    L1Client::new(L1Config {
-                        endpoint: provider.base_url,
-                        model: provider.model,
-                        max_tokens: provider.max_tokens,
-                        temperature: provider.temperature,
-                        timeout: Duration::from_millis(provider.timeout_ms),
-                        api_key: None,
-                    })
-                    .ok()
-                } else {
-                    None
-                };
                 while let Ok((generation, prompt)) = request_rx.recv() {
                     let (sanitized, dlp_report) = sanitize_prompt(&prompt);
                     let redaction_timestamp = unix_timestamp_millis();
@@ -705,11 +899,26 @@ impl L1Worker {
                             tracing::error!(%error, "could not queue pre-request DLP audit event");
                         }
                     }
-                    let response = match client.as_ref() {
-                        Some(client) => client
-                            .complete_sanitized(&prompt, &sanitized)
-                            .unwrap_or_else(|_| L1_OFFLINE_MESSAGE.to_owned()),
-                        None => L1_OFFLINE_MESSAGE.to_owned(),
+                    // Rebuild the local client for each request. LM Studio may
+                    // start after SAC, restart, or briefly drop its listener;
+                    // a client captured at worker startup would stay offline
+                    // forever after the first failed initialization.
+                    let response = if provider.enabled && provider.backend == "openai_compatible" {
+                        match L1Client::new(L1Config {
+                            endpoint: provider.base_url.clone(),
+                            model: provider.model.clone(),
+                            max_tokens: provider.max_tokens,
+                            temperature: provider.temperature,
+                            timeout: Duration::from_millis(provider.timeout_ms),
+                            api_key: None,
+                        }) {
+                            Ok(client) => client
+                                .complete_sanitized(&prompt, &sanitized)
+                                .unwrap_or_else(|error| format!("L1 request failed: {error}")),
+                            Err(error) => format!("L1 request failed: {error}"),
+                        }
+                    } else {
+                        L1_OFFLINE_MESSAGE.to_owned()
                     };
                     if response_tx
                         .send((generation, response, dlp_report.clone()))
@@ -911,6 +1120,7 @@ fn display_state(
     alerts: &BTreeMap<u32, Alert>,
     command_response: Option<&str>,
     config: &Config,
+    console: &VecDeque<ConsoleEntry>,
 ) -> DisplayState {
     DisplayState {
         telemetry_available: true,
@@ -922,6 +1132,7 @@ fn display_state(
         system_state: map_state(state),
         pending_alerts: alerts.values().cloned().collect(),
         command_response: command_response.map(str::to_owned),
+        console: console.clone(),
         thresholds: DisplayThresholds {
             cpu_yellow_pct: config.thresholds.cpu.yellow_pct,
             ram_yellow_pct: config.thresholds.ram.yellow_pct,
@@ -929,6 +1140,23 @@ fn display_state(
             vram_yellow_pct: config.thresholds.vram.yellow_pct,
             vram_red_pct: config.thresholds.vram.red_pct,
         },
+    }
+}
+
+fn push_console(
+    console: &mut VecDeque<ConsoleEntry>,
+    source: &'static str,
+    level: LogLevel,
+    text: String,
+) {
+    console.push_back(ConsoleEntry {
+        timestamp: Instant::now(),
+        source,
+        level,
+        text,
+    });
+    while console.len() > 100 {
+        console.pop_front();
     }
 }
 
@@ -1001,6 +1229,53 @@ fn format_l1_response(response: String, report: &DLPReport) -> String {
     )
 }
 
+struct ValidatedL1Response {
+    status: &'static str,
+    text: String,
+}
+
+const L1_UNAVAILABLE_FALLBACK: &str =
+    "[L1 UNAVAILABLE] Brak merytorycznej odpowiedzi modelu. Sprawdź 'status' lokalny.";
+
+fn validate_l1_response(response: String) -> ValidatedL1Response {
+    let trimmed = response.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("L1 request failed:")
+        || trimmed.starts_with("L1 offline")
+        || has_repeated_content(trimmed)
+    {
+        return ValidatedL1Response {
+            status: "[L1 UNVERIFIED]",
+            text: L1_UNAVAILABLE_FALLBACK.to_owned(),
+        };
+    }
+
+    let structured = ["Diagnoza:", "Przyczyna:", "Sugerowana komenda:"]
+        .iter()
+        .all(|marker| trimmed.contains(marker));
+    ValidatedL1Response {
+        status: if structured {
+            "[L1 VERIFIED]"
+        } else {
+            "[L1 UNVERIFIED]"
+        },
+        text: trimmed.to_owned(),
+    }
+}
+
+fn has_repeated_content(text: &str) -> bool {
+    let lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let mut counts = std::collections::HashMap::new();
+    for line in lines {
+        let count = counts.entry(line).or_insert(0_u8);
+        *count = count.saturating_add(1);
+        if *count >= 3 {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,6 +1318,7 @@ mod tests {
             generation,
             snapshot,
             pending_confirmation,
+            None,
         )
     }
 
@@ -1320,6 +1596,155 @@ mod tests {
     }
 
     #[test]
+    fn help_lists_only_executable_commands_without_calling_l1() {
+        let mut config = Config::default();
+        config.l1_provider.enabled = false;
+        let mut worker = L1Worker::spawn(&config);
+
+        let response = test_handle_command("pomoc", &mut worker, &config, 10, None, &mut None)
+            .expect("help response");
+
+        assert!(response.contains("Wykonywalne polecenia SAC"));
+        assert!(response.contains("kill"));
+        assert!(response.contains("drop caches"));
+        assert!(worker.try_response().is_none());
+    }
+
+    #[test]
+    fn system_queries_use_local_snapshot_instead_of_l1() {
+        let status = local_system_response("stan systemu", Some(&snapshot())).unwrap();
+        assert!(status.contains("CPU: 12.5%"));
+        assert!(status.contains("RAM: 25.0%"));
+
+        let processes = local_system_response("procesy", Some(&snapshot())).unwrap();
+        assert!(processes.contains("cargo (PID 42"));
+    }
+
+    #[test]
+    fn l1_validator_marks_structured_and_fallback_responses() {
+        let verified = validate_l1_response(
+            "Diagnoza: RAM rośnie.\nPrzyczyna: RSS PID 42 wzrósł.\nSugerowana komenda: ignoruj"
+                .to_owned(),
+        );
+        assert_eq!(verified.status, "[L1 VERIFIED]");
+
+        let timeout = validate_l1_response("L1 request failed: L1 request timed out".to_owned());
+        assert_eq!(timeout.status, "[L1 UNVERIFIED]");
+        assert_eq!(timeout.text, L1_UNAVAILABLE_FALLBACK);
+
+        let repeated = validate_l1_response("to samo\nto samo\nto samo".to_owned());
+        assert_eq!(repeated.text, L1_UNAVAILABLE_FALLBACK);
+    }
+
+    #[test]
+    fn user_scenario_matrix_50_inputs() {
+        let inputs = [
+            "pomoc",
+            "help",
+            "komendy",
+            "commands",
+            "?",
+            "status",
+            "stan systemu",
+            "system",
+            "monitoring",
+            "procesy",
+            "processes",
+            "lista procesow",
+            "ram",
+            "pamiec",
+            "cpu",
+            "procesor",
+            "kill chrome",
+            "zabij firefox",
+            "ubij node",
+            "zamknij cargo",
+            "terminate java",
+            "freeze chrome",
+            "zamroz firefox",
+            "pause node",
+            "stop cargo",
+            "wstrzymaj java",
+            "resume 42",
+            "wznow 42",
+            "unpause 42",
+            "odblokuj 42",
+            "odmroz 42",
+            "drop caches",
+            "wyczysc cache",
+            "clear cache",
+            "clean cache",
+            "dlaczego ram rosnie?",
+            "why is cpu high?",
+            "what is system state?",
+            "jakie procesy dzialaja?",
+            "wyjasnij alert",
+            "explain memory",
+            "analizuj ten stan",
+            "analyze current load",
+            "czy system jest bezpieczny?",
+            "tak",
+            "nie",
+            "co widzisz?",
+            "raport",
+            "sprawdz system",
+            "jaki jest stan?",
+        ];
+        assert_eq!(inputs.len(), 50);
+
+        let config = Config::default();
+        let classifier = l0::IntentClassifier::new(l0_classifier_config(&config));
+        let snapshot = snapshot();
+        let local = [
+            "status",
+            "stan systemu",
+            "system",
+            "monitoring",
+            "procesy",
+            "processes",
+            "lista procesow",
+            "ram",
+            "pamiec",
+            "cpu",
+            "procesor",
+        ];
+        let help = ["pomoc", "help", "komendy", "commands", "?"];
+        let mut routed_commands = 0;
+        let mut local_answers = 0;
+        let mut help_answers = 0;
+        let mut l1_questions = 0;
+
+        for input in inputs {
+            if help.contains(&input) {
+                let response = executable_commands_help();
+                assert!(response.contains("Wykonywalne polecenia SAC"), "{input}");
+                help_answers += 1;
+            } else if local.contains(&input) {
+                let response = local_system_response(input, Some(&snapshot)).expect(input);
+                assert!(!response.is_empty(), "{input}");
+                local_answers += 1;
+            } else if !matches!(router::parse(input), router::Action::QueryL1(_)) {
+                routed_commands += 1;
+            } else {
+                let intent = classifier.classify(input);
+                assert!(
+                    matches!(
+                        intent,
+                        l0::Intent::Analysis { .. } | l0::Intent::Unknown { .. }
+                    ),
+                    "{input}"
+                );
+                l1_questions += 1;
+            }
+        }
+
+        assert_eq!(help_answers, 5);
+        assert_eq!(local_answers, 11);
+        assert_eq!(routed_commands, 19);
+        assert_eq!(l1_questions, 15);
+    }
+
+    #[test]
     fn sentinel_l0_config_maps_to_classifier_config() {
         let mut config = Config::default();
         config.l0.use_model = true;
@@ -1351,6 +1776,7 @@ mod tests {
             &alerts,
             None,
             &Config::default(),
+            &VecDeque::new(),
         );
 
         assert_eq!(display.cpu_pct, 12.5);
@@ -1372,6 +1798,7 @@ mod tests {
             &alerts,
             Some("ok"),
             &Config::default(),
+            &VecDeque::new(),
         );
 
         assert_eq!(display.command_response.as_deref(), Some("ok"));
@@ -1419,6 +1846,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             &config,
+            &VecDeque::new(),
         );
 
         assert_eq!(
@@ -1430,6 +1858,29 @@ mod tests {
                 vram_yellow_pct: 71.0,
                 vram_red_pct: 91.0,
             }
+        );
+    }
+
+    #[test]
+    fn live_console_keeps_latest_100_entries() {
+        let mut console = VecDeque::new();
+        for index in 0..105 {
+            push_console(
+                &mut console,
+                "ROUTER",
+                LogLevel::Info,
+                format!("entry-{index}"),
+            );
+        }
+
+        assert_eq!(console.len(), 100);
+        assert_eq!(
+            console.front().map(|entry| entry.text.as_str()),
+            Some("entry-5")
+        );
+        assert_eq!(
+            console.back().map(|entry| entry.text.as_str()),
+            Some("entry-104")
         );
     }
 
@@ -1655,7 +2106,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         let report = loop {
             if let Some((_, response, report)) = worker.try_response() {
-                assert_eq!(response, L1_OFFLINE_MESSAGE);
+                assert!(response.contains("L1 request failed: L1 service returned HTTP 500"));
                 break report;
             }
             assert!(Instant::now() < deadline, "L1 worker did not respond");

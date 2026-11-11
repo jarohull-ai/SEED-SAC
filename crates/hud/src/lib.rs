@@ -8,7 +8,9 @@ pub mod indicators;
 pub mod notifications;
 
 use arc_swap::ArcSwap;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 pub use app::{SacApp, UserAction};
 
@@ -30,7 +32,25 @@ pub struct DisplayState {
     pub pending_alerts: Vec<Alert>,
     /// Feedback from the last executed command.
     pub command_response: Option<String>,
+    /// Persistent operator-visible history of sentinel, router, DLP and L1 events.
+    pub console: VecDeque<ConsoleEntry>,
     pub thresholds: DisplayThresholds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogLevel {
+    Info,
+    L1Response,
+    Warning,
+    Alert,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsoleEntry {
+    pub timestamp: Instant,
+    pub source: &'static str,
+    pub level: LogLevel,
+    pub text: String,
 }
 
 /// Policy thresholds used to colour the telemetry indicators.
@@ -70,6 +90,7 @@ impl Default for DisplayState {
             system_state: SystemState::Green,
             pending_alerts: Vec::new(),
             command_response: None,
+            console: VecDeque::new(),
             thresholds: DisplayThresholds::default(),
         }
     }

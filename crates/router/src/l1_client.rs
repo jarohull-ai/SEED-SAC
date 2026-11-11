@@ -16,6 +16,7 @@ const DEFAULT_TEMPERATURE: f32 = 0.2;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_RESPONSE_BYTES: u64 = 256 * 1024;
+const SYSTEM_GUIDANCE: &str = "You are SEED SAC's local Linux system copilot. Use only the Sentinel grounding snapshot supplied by the user message. Answer the exact question and do not invent a different topic. Return exactly three lines: Diagnoza: <one concise sentence>; Przyczyna: <one fact from telemetry>; Sugerowana komenda: <one safe command such as 'ubij <PID>', 'drop cache', or 'ignoruj'>. If telemetry is insufficient, say so in those three lines and use 'ignoruj' rather than inventing facts. Never claim to have executed a command.";
 
 /// Configuration for one L1 client.
 #[derive(Debug, Clone)]
@@ -167,7 +168,10 @@ impl L1Client {
         );
         let body = serde_json::json!({
             "model": self.config.model,
-            "messages": [{"role": "user", "content": sanitized}],
+            "messages": [
+                {"role": "system", "content": SYSTEM_GUIDANCE},
+                {"role": "user", "content": sanitized},
+            ],
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": false,
@@ -413,13 +417,18 @@ mod tests {
             .rules_applied
             .contains(&"Command Password".to_string()));
         let body = body_rx.recv().expect("captured JSON request body");
-        let content = body["messages"][0]["content"]
+        let content = body["messages"][1]["content"]
             .as_str()
             .expect("messages[0].content string");
         assert!(!content.contains("ghp_"));
         assert!(!content.contains("hunter2"));
         assert!(content.contains("[REDACTED:GITHUB_PAT]"));
         assert!(content.contains("[REDACTED:PASSWORD]"));
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Diagnoza:"));
         server.join().unwrap();
     }
 }
