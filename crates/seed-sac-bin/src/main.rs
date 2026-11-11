@@ -253,15 +253,17 @@ fn run_sentinel(
     let mut pending_confirmation: Option<PendingConfirmation> = None;
     let mut next_sample_at = Instant::now();
     let mut latest_snapshot: Option<SystemSnapshot> = None;
+    let mut latest_snapshot_id = 0_u64;
     let mut latest_deltas: Vec<ProcessDelta> = Vec::new();
     let mut latest_state = SystemState::Green;
-    let mut pending_l1_diagnosis: Option<(u64, DeterministicDiagnosis)> = None;
+    let mut pending_l1_diagnosis: Option<(u64, u64, DeterministicDiagnosis)> = None;
     let mut state_dirty = true;
     while running.load(Ordering::Acquire) {
         if Instant::now() >= next_sample_at {
             let snapshot = sampler.poll();
+            latest_snapshot_id = latest_snapshot_id.saturating_add(1);
             let deltas = tracker.update(&snapshot);
-            let state = policy::evaluate(&snapshot, &config);
+            let state = policy::evaluate_with_previous(&snapshot, &config, latest_state);
             let actions = guard::mitigate(state, &deltas, &config);
 
             // Log state transitions
@@ -279,7 +281,7 @@ fn run_sentinel(
                     } else {
                         LogLevel::Info
                     },
-                    format!("Stan zasobów: {state_name}"),
+                    format!("[snapshot #{latest_snapshot_id}] Stan zasobów: {state_name}"),
                 );
                 let event_type = match state {
                     SystemState::Yellow => Some(EventType::YellowEnter),
@@ -387,12 +389,20 @@ fn run_sentinel(
 
         while let Some((generation, response, dlp_report)) = l1_worker.try_response() {
             if generation == command_generation {
-                let diagnosis = pending_l1_diagnosis
+                let (snapshot_id, diagnosis) = pending_l1_diagnosis
                     .take()
-                    .map(|(_, diagnosis)| diagnosis)
-                    .unwrap_or_else(|| deterministic_diagnosis(None, latest_state, &[], &alerts));
+                    .map(|(_, snapshot_id, diagnosis)| (snapshot_id, diagnosis))
+                    .unwrap_or_else(|| {
+                        (
+                            latest_snapshot_id,
+                            deterministic_diagnosis(None, latest_state, &[], &alerts),
+                        )
+                    });
                 let validated = validate_l1_explanation(response, &diagnosis);
-                let rendered = diagnosis.render(validated.text.as_deref());
+                let rendered = format!(
+                    "Snapshot Sentinel #{snapshot_id}:\n{}",
+                    diagnosis.render(validated.text.as_deref())
+                );
                 let response_with_dlp = format_l1_response(rendered, &dlp_report);
                 push_console(
                     &mut console,
@@ -431,7 +441,8 @@ fn run_sentinel(
                 &latest_deltas,
                 &alerts,
             );
-            pending_l1_diagnosis = Some((command_generation, diagnosis.clone()));
+            pending_l1_diagnosis =
+                Some((command_generation, latest_snapshot_id, diagnosis.clone()));
             if let Some(response) = handle_command(
                 &text,
                 &l0_classifier,
@@ -447,6 +458,7 @@ fn run_sentinel(
                     &latest_deltas,
                     &alerts,
                     &diagnosis,
+                    latest_snapshot_id,
                 )),
             ) {
                 push_console(&mut console, "ROUTER", LogLevel::Info, response.clone());
@@ -909,10 +921,11 @@ fn l1_prompt_context(
     deltas: &[ProcessDelta],
     alerts: &BTreeMap<u32, Alert>,
     diagnosis: &DeterministicDiagnosis,
+    snapshot_id: u64,
 ) -> String {
     let Some(snapshot) = snapshot else {
         return format!(
-            "Deterministic diagnosis: {}\nFacts: {}\nSuggested action: {}\nUser query:\n{query}",
+            "Sentinel snapshot: #{snapshot_id}\nDeterministic diagnosis: {}\nFacts: {}\nSuggested action: {}\nUser query:\n{query}",
             diagnosis.diagnosis,
             diagnosis.cause_facts,
             diagnosis.suggested_command()
@@ -952,7 +965,7 @@ fn l1_prompt_context(
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "Deterministic diagnosis: {}\nDeterministic facts: {}\nDeterministic suggested action: {}\nSentinel grounding snapshot: state={}; CPU={:.1}%; RAM={:.1}% ({:.1}/{:.1} GiB); top 3 processes={}. Frozen processes are marked FROZEN(SIGSTOP).\nUser query:\n{query}",
+        "Sentinel snapshot: #{snapshot_id}\nDeterministic diagnosis: {}\nDeterministic facts: {}\nDeterministic suggested action: {}\nSentinel grounding snapshot: state={}; CPU={:.1}%; RAM={:.1}% ({:.1}/{:.1} GiB); top 3 processes={}. Frozen processes are marked FROZEN(SIGSTOP).\nUser query:\n{query}",
         diagnosis.diagnosis,
         diagnosis.cause_facts,
         diagnosis.suggested_command(),
@@ -1992,6 +2005,25 @@ mod tests {
 
         let processes = local_system_response("procesy", Some(&snapshot())).unwrap();
         assert!(processes.contains("cargo (PID 42"));
+    }
+
+    #[test]
+    fn l1_prompt_and_rendered_frame_carry_snapshot_identity() {
+        let frame =
+            deterministic_diagnosis(Some(&snapshot()), SystemState::Green, &[], &BTreeMap::new());
+        let prompt = l1_prompt_context(
+            "dlaczego?",
+            Some(&snapshot()),
+            SystemState::Green,
+            &[],
+            &BTreeMap::new(),
+            &frame,
+            17,
+        );
+        assert!(prompt.contains("Sentinel snapshot: #17"));
+
+        let rendered = format!("Snapshot Sentinel #17:\n{}", frame.render(None));
+        assert!(rendered.starts_with("Snapshot Sentinel #17:"));
     }
 
     #[test]

@@ -6,7 +6,22 @@ use crate::{SystemSnapshot, SystemState};
 
 /// RAM and VRAM drive yellow and red; CPU can only drive yellow. Red wins.
 pub fn evaluate(snapshot: &SystemSnapshot, config: &Config) -> SystemState {
+    evaluate_with_previous(snapshot, config, SystemState::Green)
+}
+
+/// Evaluate resource pressure with hysteresis so values hovering around a
+/// threshold do not make the operator-visible state oscillate every sample.
+/// The previous state is only used for releasing an already active level;
+/// entering YELLOW/RED still uses the configured thresholds exactly.
+pub fn evaluate_with_previous(
+    snapshot: &SystemSnapshot,
+    config: &Config,
+    previous: SystemState,
+) -> SystemState {
     let thresholds = &config.thresholds;
+    const RAM_RELEASE_MARGIN: f32 = 2.0;
+    const VRAM_RELEASE_MARGIN: f32 = 2.0;
+    const CPU_RELEASE_MARGIN: f32 = 5.0;
 
     let ram_pct = percent(snapshot.ram_used_bytes, snapshot.ram_total_bytes);
     let vram_pct = match (snapshot.vram_used_bytes, snapshot.vram_total_bytes) {
@@ -14,16 +29,23 @@ pub fn evaluate(snapshot: &SystemSnapshot, config: &Config) -> SystemState {
         _ => None,
     };
 
-    if ram_pct >= thresholds.ram.red_pct
-        || vram_pct.is_some_and(|pct| pct >= thresholds.vram.red_pct)
-    {
+    let red_entered = ram_pct >= thresholds.ram.red_pct
+        || vram_pct.is_some_and(|pct| pct >= thresholds.vram.red_pct);
+    let red_held = previous == SystemState::Red
+        && (ram_pct >= thresholds.ram.red_pct - RAM_RELEASE_MARGIN
+            || vram_pct.is_some_and(|pct| pct >= thresholds.vram.red_pct - VRAM_RELEASE_MARGIN));
+    if red_entered || red_held {
         return SystemState::Red;
     }
 
-    if ram_pct >= thresholds.ram.yellow_pct
+    let yellow_entered = ram_pct >= thresholds.ram.yellow_pct
         || vram_pct.is_some_and(|pct| pct >= thresholds.vram.yellow_pct)
-        || snapshot.cpu_usage_pct >= thresholds.cpu.yellow_pct
-    {
+        || snapshot.cpu_usage_pct >= thresholds.cpu.yellow_pct;
+    let yellow_held = previous == SystemState::Yellow
+        && (ram_pct >= thresholds.ram.yellow_pct - RAM_RELEASE_MARGIN
+            || vram_pct.is_some_and(|pct| pct >= thresholds.vram.yellow_pct - VRAM_RELEASE_MARGIN)
+            || snapshot.cpu_usage_pct >= thresholds.cpu.yellow_pct - CPU_RELEASE_MARGIN);
+    if yellow_entered || yellow_held {
         return SystemState::Yellow;
     }
 
@@ -106,6 +128,36 @@ mod tests {
         assert_eq!(
             evaluate(&snapshot(0.0, 10.0, Some(85.0)), &Config::default()),
             SystemState::Yellow
+        );
+    }
+
+    #[test]
+    fn threshold_hysteresis_prevents_yellow_red_oscillation() {
+        let config = Config::default();
+        assert_eq!(
+            evaluate_with_previous(&snapshot(0.0, 88.5, None), &config, SystemState::Yellow),
+            SystemState::Red
+        );
+        assert_eq!(
+            evaluate_with_previous(&snapshot(0.0, 87.5, None), &config, SystemState::Red),
+            SystemState::Red
+        );
+        assert_eq!(
+            evaluate_with_previous(&snapshot(0.0, 85.5, None), &config, SystemState::Red),
+            SystemState::Yellow
+        );
+    }
+
+    #[test]
+    fn threshold_hysteresis_keeps_yellow_until_pressure_clears() {
+        let config = Config::default();
+        assert_eq!(
+            evaluate_with_previous(&snapshot(0.0, 74.0, None), &config, SystemState::Yellow),
+            SystemState::Yellow
+        );
+        assert_eq!(
+            evaluate_with_previous(&snapshot(0.0, 72.5, None), &config, SystemState::Yellow),
+            SystemState::Green
         );
     }
 
