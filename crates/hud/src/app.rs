@@ -2,7 +2,10 @@ use std::collections::BTreeSet;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
-use crate::{indicators, notifications, ConsoleEntry, LogLevel, SharedDisplayState, UserCommand};
+use crate::{
+    indicators, notifications, ConsoleEntry, LogLevel, SharedDisplayState, SuggestedAction,
+    UserCommand,
+};
 
 const MAX_COMMAND_INPUT_CHARS: usize = 4096;
 const CONFIRM_COMMAND: &str = "__sac_confirm";
@@ -14,6 +17,8 @@ const HELP_COMMAND: &str = "__sac_help";
 pub enum UserAction {
     Resume(u32),
     Terminate(u32),
+    ArmSuggestedKill(u32),
+    ArmSuggestedFreeze(u32),
 }
 
 pub struct SacApp {
@@ -24,6 +29,7 @@ pub struct SacApp {
     input_focus_requested: bool,
     input_was_truncated: bool,
     confirmation_in_flight: bool,
+    suggested_action_in_flight: bool,
     alert_action_in_flight: bool,
     last_alert_pids: BTreeSet<u32>,
 }
@@ -42,6 +48,7 @@ impl SacApp {
             input_focus_requested: false,
             input_was_truncated: false,
             confirmation_in_flight: false,
+            suggested_action_in_flight: false,
             alert_action_in_flight: false,
             last_alert_pids: BTreeSet::new(),
         }
@@ -69,6 +76,22 @@ impl SacApp {
             }
         } else {
             self.alert_action_in_flight = false;
+        }
+        if state.command_response.is_some() || state.suggested_action.is_none() {
+            self.suggested_action_in_flight = false;
+        }
+    }
+
+    fn submit_suggested_action(&mut self, action: SuggestedAction) {
+        if self.suggested_action_in_flight {
+            return;
+        }
+        let user_action = match action {
+            SuggestedAction::Kill(pid) => UserAction::ArmSuggestedKill(pid),
+            SuggestedAction::Freeze(pid) => UserAction::ArmSuggestedFreeze(pid),
+        };
+        if self.action_tx.send(user_action).is_ok() {
+            self.suggested_action_in_flight = true;
         }
     }
 
@@ -178,6 +201,32 @@ impl SacApp {
                         }
                     }
                 });
+                if let Some(action) = state.suggested_action {
+                    let (label, button_text) = match action {
+                        SuggestedAction::Kill(pid) => (
+                            format!("Sugerowana komenda: ubij {pid}"),
+                            format!("Wykonaj: ubij {pid}"),
+                        ),
+                        SuggestedAction::Freeze(pid) => (
+                            format!("Sugerowana komenda: zamroz {pid}"),
+                            format!("Wykonaj: zamroz {pid}"),
+                        ),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(label).strong());
+                        if ui
+                            .add_enabled(
+                                !confirmation_visible
+                                    && !self.confirmation_in_flight
+                                    && !self.suggested_action_in_flight,
+                                egui::Button::new(button_text),
+                            )
+                            .clicked()
+                        {
+                            self.submit_suggested_action(action);
+                        }
+                    });
+                }
                 egui::ScrollArea::vertical()
                     .id_salt("sac_live_console_scroll")
                     .stick_to_bottom(true)
@@ -474,6 +523,7 @@ mod tests {
         let shared = crate::new_shared_state();
         let mut state = crate::DisplayState {
             command_response: Some("POTWIERDZENIE: kill".to_owned()),
+            suggested_action: Some(crate::SuggestedAction::Kill(42)),
             ..crate::DisplayState::default()
         };
         state.console.push_back(crate::ConsoleEntry {
@@ -491,5 +541,20 @@ mod tests {
 
         app.submit_confirmation(CONFIRM_COMMAND);
         assert_eq!(command_rx.try_recv().unwrap().0, CONFIRM_COMMAND);
+    }
+
+    #[test]
+    fn suggested_action_arms_without_sending_text_command() {
+        let (mut app, _command_rx) = app();
+        let (action_tx, action_rx) = mpsc::channel();
+        app.action_tx = action_tx;
+
+        app.submit_suggested_action(SuggestedAction::Kill(42));
+
+        assert_eq!(
+            action_rx.try_recv().unwrap(),
+            UserAction::ArmSuggestedKill(42)
+        );
+        assert!(app.suggested_action_in_flight);
     }
 }

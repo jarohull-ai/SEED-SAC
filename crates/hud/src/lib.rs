@@ -32,6 +32,8 @@ pub struct DisplayState {
     pub pending_alerts: Vec<Alert>,
     /// Feedback from the last executed command.
     pub command_response: Option<String>,
+    /// Deterministic action currently suggested by Sentinel, if any.
+    pub suggested_action: Option<SuggestedAction>,
     /// Persistent operator-visible history of sentinel, router, DLP and L1 events.
     pub console: VecDeque<ConsoleEntry>,
     pub thresholds: DisplayThresholds,
@@ -90,6 +92,7 @@ impl Default for DisplayState {
             system_state: SystemState::Green,
             pending_alerts: Vec::new(),
             command_response: None,
+            suggested_action: None,
             console: VecDeque::new(),
             thresholds: DisplayThresholds::default(),
         }
@@ -101,6 +104,12 @@ pub enum SystemState {
     Green,
     Yellow,
     Red,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SuggestedAction {
+    Kill(u32),
+    Freeze(u32),
 }
 
 #[derive(Debug, Clone)]

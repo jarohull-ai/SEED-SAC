@@ -461,6 +461,12 @@ fn run_sentinel(
             banner.as_ref().map(|banner| banner.text.as_str()),
             &config,
             &console,
+            Some(&deterministic_diagnosis(
+                latest_snapshot.as_ref(),
+                latest_state,
+                &latest_deltas,
+                &alerts,
+            )),
         )));
 
         // Age the reply only after it has been published, so it stays visible
@@ -476,15 +482,31 @@ fn run_sentinel(
         match action_rx.recv_timeout(wait_for) {
             Ok(action) => {
                 let was_resume = matches!(action, UserAction::Resume(_));
-                if let Some(response) = handle_user_action(
+                let response = if matches!(
                     action,
-                    latest_snapshot.as_ref(),
-                    &config,
-                    &mut alerts,
-                    &mut alert_targets,
-                    &mut pending_confirmation,
-                    &event_writer,
+                    UserAction::ArmSuggestedKill(_) | UserAction::ArmSuggestedFreeze(_)
                 ) {
+                    arm_suggested_action(
+                        action,
+                        latest_snapshot.as_ref(),
+                        latest_state,
+                        &latest_deltas,
+                        &alerts,
+                        &config,
+                        &mut pending_confirmation,
+                    )
+                } else {
+                    handle_user_action(
+                        action,
+                        latest_snapshot.as_ref(),
+                        &config,
+                        &mut alerts,
+                        &mut alert_targets,
+                        &mut pending_confirmation,
+                        &event_writer,
+                    )
+                };
+                if let Some(response) = response {
                     banner = Some(CommandBanner::new(response.clone(), Instant::now()));
                     push_console(&mut console, "SENTINEL", LogLevel::Info, response);
                 } else if was_resume {
@@ -943,7 +965,7 @@ fn execute_pending_action(
 ) -> Option<String> {
     match action {
         PendingAction::Router { action, identity } => {
-            if let router::Action::Kill(_) = action {
+            if matches!(action, router::Action::Kill(_) | router::Action::Freeze(_)) {
                 let Some(identity) = identity else {
                     return Some(
                         "Brak zweryfikowanej tożsamości procesu — akcja zablokowana".to_owned(),
@@ -955,12 +977,17 @@ fn execute_pending_action(
                         identity.name
                     ));
                 }
-                return match guard::execute_for(
-                    &GuardAction::Kill { pid: identity.pid },
-                    &identity,
-                    config,
-                ) {
-                    Ok(()) => Some(format!("Zamknięto {}", identity.name)),
+                let guard_action = match action {
+                    router::Action::Kill(_) => GuardAction::Kill { pid: identity.pid },
+                    router::Action::Freeze(_) => GuardAction::Freeze { pid: identity.pid },
+                    _ => unreachable!(),
+                };
+                return match guard::execute_for(&guard_action, &identity, config) {
+                    Ok(()) => Some(match guard_action {
+                        GuardAction::Kill { .. } => format!("Zamknięto {}", identity.name),
+                        GuardAction::Freeze { .. } => format!("Zamrożono {}", identity.name),
+                        _ => unreachable!(),
+                    }),
                     Err(error) => Some(format!("Błąd: {error}")),
                 };
             }
@@ -1167,7 +1194,72 @@ fn user_action_guard_actions(action: UserAction) -> Vec<GuardAction> {
         UserAction::Terminate(pid) => {
             vec![GuardAction::Thaw { pid }, GuardAction::Terminate { pid }]
         }
+        UserAction::ArmSuggestedKill(_) | UserAction::ArmSuggestedFreeze(_) => {
+            unreachable!("suggested actions do not execute directly")
+        }
     }
+}
+
+fn arm_suggested_action(
+    action: UserAction,
+    snapshot: Option<&SystemSnapshot>,
+    state: SystemState,
+    deltas: &[ProcessDelta],
+    alerts: &BTreeMap<u32, Alert>,
+    config: &Config,
+    pending_confirmation: &mut Option<PendingConfirmation>,
+) -> Option<String> {
+    let (expected_pid, expected_kind) = match action {
+        UserAction::ArmSuggestedKill(pid) => (pid, "ubij"),
+        UserAction::ArmSuggestedFreeze(pid) => (pid, "zamroz"),
+        UserAction::Resume(_) | UserAction::Terminate(_) => {
+            unreachable!("only suggested actions reach this function")
+        }
+    };
+    let diagnosis = deterministic_diagnosis(snapshot, state, deltas, alerts);
+    let (router_action, identity) = match (&diagnosis.suggested_action, expected_kind) {
+        (SuggestedAction::Kill(identity), "ubij") if expected_pid == identity.pid => {
+            if sentinel::policy::is_immune(&identity.name, config) {
+                return Some(format!(
+                    "{} jest na liście procesów chronionych — akcja zablokowana",
+                    identity.name
+                ));
+            }
+            (
+                router::Action::Kill(identity.name.clone()),
+                identity.clone(),
+            )
+        }
+        (SuggestedAction::Freeze(identity), "zamroz") if expected_pid == identity.pid => (
+            router::Action::Freeze(identity.name.clone()),
+            identity.clone(),
+        ),
+        _ => {
+            return Some(
+                "Diagnoza wygasła lub tożsamość procesu zmieniła się — akcja zablokowana"
+                    .to_owned(),
+            );
+        }
+    };
+    if pending_confirmation
+        .as_ref()
+        .is_some_and(|pending| Instant::now() < pending.expires_at)
+    {
+        return Some("POTWIERDZENIE: Oczekuje już decyzja dla akcji".to_owned());
+    }
+    *pending_confirmation = Some(PendingConfirmation {
+        action: PendingAction::Router {
+            action: router_action,
+            identity: Some(identity.clone()),
+        },
+        expires_at: Instant::now() + CONFIRMATION_TTL,
+    });
+    Some(format!(
+        "POTWIERDZENIE: Wykonanie '{}' dla procesu '{}' (PID {})\nNaciśnij Enter lub wybierz Potwierdź, aby wykonać.",
+        expected_kind,
+        identity.name,
+        identity.pid
+    ))
 }
 
 /// Execute a decision made in the HUD.
@@ -1188,6 +1280,9 @@ fn handle_user_action(
 ) -> Option<String> {
     let pid = match action {
         UserAction::Resume(pid) | UserAction::Terminate(pid) => pid,
+        UserAction::ArmSuggestedKill(_) | UserAction::ArmSuggestedFreeze(_) => {
+            unreachable!("suggested actions are handled before alert actions")
+        }
     };
 
     let Some(identity) = alert_targets.get(&pid).cloned() else {
@@ -1304,6 +1399,7 @@ fn display_state(
     command_response: Option<&str>,
     config: &Config,
     console: &VecDeque<ConsoleEntry>,
+    diagnosis: Option<&DeterministicDiagnosis>,
 ) -> DisplayState {
     DisplayState {
         telemetry_available: true,
@@ -1315,6 +1411,11 @@ fn display_state(
         system_state: map_state(state),
         pending_alerts: alerts.values().cloned().collect(),
         command_response: command_response.map(str::to_owned),
+        suggested_action: diagnosis.and_then(|diagnosis| match &diagnosis.suggested_action {
+            SuggestedAction::Kill(identity) => Some(hud::SuggestedAction::Kill(identity.pid)),
+            SuggestedAction::Freeze(identity) => Some(hud::SuggestedAction::Freeze(identity.pid)),
+            SuggestedAction::Ignore => None,
+        }),
         console: console.clone(),
         thresholds: DisplayThresholds {
             cpu_yellow_pct: config.thresholds.cpu.yellow_pct,
@@ -1906,6 +2007,56 @@ mod tests {
     }
 
     #[test]
+    fn suggested_action_rechecks_current_identity_before_arming() {
+        let mut pending = None;
+        let config = Config::default();
+        let delta = ProcessDelta {
+            pid: 42,
+            name: "cargo".to_owned(),
+            start_time: 1,
+            rss_bytes: 512 * 1024 * 1024,
+            delta_bytes_per_sec: 768 * 1024 * 1024,
+        };
+        let response = arm_suggested_action(
+            UserAction::ArmSuggestedKill(42),
+            Some(&snapshot()),
+            SystemState::Red,
+            &[delta],
+            &BTreeMap::new(),
+            &config,
+            &mut pending,
+        );
+        assert!(response
+            .as_deref()
+            .is_some_and(|text| text.starts_with("POTWIERDZENIE:")));
+        assert!(matches!(
+            pending,
+            Some(PendingConfirmation {
+                action: PendingAction::Router {
+                    action: router::Action::Kill(_),
+                    identity: Some(_),
+                },
+                ..
+            })
+        ));
+
+        let mut stale_pending = None;
+        let stale_response = arm_suggested_action(
+            UserAction::ArmSuggestedKill(99999),
+            Some(&snapshot()),
+            SystemState::Red,
+            &[],
+            &BTreeMap::new(),
+            &config,
+            &mut stale_pending,
+        );
+        assert!(stale_response
+            .as_deref()
+            .is_some_and(|text| text.contains("zablokowana")));
+        assert!(stale_pending.is_none());
+    }
+
+    #[test]
     fn user_scenario_matrix_60_inputs() {
         let inputs = [
             "pomoc",
@@ -2058,6 +2209,7 @@ mod tests {
             None,
             &Config::default(),
             &VecDeque::new(),
+            None,
         );
 
         assert_eq!(display.cpu_pct, 12.5);
@@ -2080,6 +2232,7 @@ mod tests {
             Some("ok"),
             &Config::default(),
             &VecDeque::new(),
+            None,
         );
 
         assert_eq!(display.command_response.as_deref(), Some("ok"));
@@ -2128,6 +2281,7 @@ mod tests {
             None,
             &config,
             &VecDeque::new(),
+            None,
         );
 
         assert_eq!(
