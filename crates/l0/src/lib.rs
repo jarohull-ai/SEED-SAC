@@ -107,16 +107,24 @@ impl IntentClassifier {
                 .clone()
                 .map(Into::into)
                 .unwrap_or_else(OnnxBackend::default_model_path);
-            Box::new(OnnxBackend::with_confidence_threshold(
-                model_path,
-                config.confidence_threshold,
-            ))
+            let backend =
+                OnnxBackend::with_confidence_threshold(model_path, config.confidence_threshold);
+            if backend.is_model_loaded() {
+                tracing::info!(model = ?backend.model_path(), "L0 initialized with ONNX backend");
+            } else {
+                tracing::info!(model = ?backend.model_path(), "L0 fallback to HeuristicBackend");
+            }
+            Box::new(backend)
         } else {
+            tracing::info!("L0 initialized with HeuristicBackend");
             Box::new(HeuristicBackend)
         };
 
         #[cfg(not(feature = "onnx"))]
-        let backend: Box<dyn ClassificationBackend> = Box::new(HeuristicBackend);
+        let backend: Box<dyn ClassificationBackend> = {
+            tracing::info!("L0 initialized with HeuristicBackend");
+            Box::new(HeuristicBackend)
+        };
         Self { config, backend }
     }
 
@@ -127,11 +135,20 @@ impl IntentClassifier {
     pub fn classify(&self, input: &str) -> Intent {
         let (intent, latency_ms) = self.backend.classify(input);
 
-        if self.config.verbose {
-            tracing::debug!(%intent, latency_ms, "L0 classified intent");
-        }
+        tracing::debug!(input = %input, ?intent, confidence = ?intent_confidence(&intent), latency_ms, "[L0] classified input");
 
         intent
+    }
+}
+
+fn intent_confidence(intent: &Intent) -> f32 {
+    match intent {
+        Intent::Unknown { reason, .. } if reason.contains("confidence") => reason
+            .split_whitespace()
+            .find_map(|part| part.trim_end_matches(',').parse::<f32>().ok())
+            .unwrap_or(0.0),
+        Intent::Unknown { .. } => 0.0,
+        Intent::Command { .. } | Intent::Analysis { .. } => 1.0,
     }
 }
 
